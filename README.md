@@ -32,7 +32,9 @@ listed so the shape of the system is visible from the start.
 
 ## Quick start
 
-Requires Docker. Nothing else.
+Requires Docker and GNU make. Everything else the project builds or runs with —
+the Go toolchain, the linter, the load generator — is pulled as an image, so
+there is nothing to install and nothing to keep in step with CI.
 
 ```bash
 make up
@@ -65,7 +67,9 @@ act on and one they cannot.
 | `make load-test-campaign-internal` | The campaign, generated inside the network |
 | `make reset` | Destroy all state and come back up clean |
 
-Run `make` on its own for the full list.
+Run `make` on its own for the full list. The two `load-test` targets that drive
+the API from the host expect a `k6` binary there; the `-internal` one, which is
+the only one whose numbers this README quotes, runs k6 from an image.
 
 ### Measure the generator before believing the numbers
 
