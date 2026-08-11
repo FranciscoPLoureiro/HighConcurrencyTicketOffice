@@ -15,6 +15,7 @@ import (
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/config"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/health"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/httpapi"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
@@ -33,6 +34,18 @@ func main() {
 		slog.Error("api exited with an error", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+// naivePurchaser adapts the phase 1 storage method to the handler's interface.
+//
+// This is the seam the project turns on. Phase 2 replaces this one type with
+// the Redis-backed purchaser and nothing in the transport layer changes, which
+// is what makes the before-and-after measurement a fair comparison: the same
+// handler, the same routes, the same client.
+type naivePurchaser struct{ *store.Store }
+
+func (p naivePurchaser) Purchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error) {
+	return p.PurchaseNaively(ctx, campaignID, userID)
 }
 
 // migrationBudget bounds how long startup waits for a database that is not yet
@@ -148,8 +161,13 @@ func run() error {
 	)
 
 	srv := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: httpapi.New(checker, logger).Routes(),
+		Addr: cfg.HTTPAddr,
+		Handler: httpapi.New(httpapi.Config{
+			Health:     checker,
+			Purchaser:  naivePurchaser{db},
+			CampaignID: cfg.CampaignID,
+			Logger:     logger,
+		}).Routes(),
 		// Every timeout is set explicitly. The zero value for each of
 		// these is "no limit", which leaves a public listener one slow
 		// client away from holding a connection open indefinitely.
