@@ -6,6 +6,36 @@
 name: ticket-office
 
 services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      HTTP_ADDR: ":8080"
+      POSTGRES_DSN: postgres://tickets:tickets@postgres:5432/tickets?sslmode=disable
+      REDIS_ADDR: redis:6379
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      # Waiting on health rather than on start. The API tolerates a missing
+      # dependency by design, but a stack that comes up reporting 503 for the
+      # first thirty seconds makes `make up` useless as a gate for the tests
+      # and the load test that follow it.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # The runtime image has no shell, so the binary probes itself.
+      test: ["CMD", "/api", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   postgres:
     image: postgres:18-alpine
     environment:

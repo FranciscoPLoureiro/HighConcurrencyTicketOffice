@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,10 +21,48 @@ import (
 )
 
 func main() {
+	// The runtime image is distroless: no shell, no curl, nothing for a
+	// container healthcheck to execute. Re-invoking this same binary keeps
+	// the image free of a toolchain an attacker could pivot to, without
+	// giving up a real readiness probe.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(probeSelf())
+	}
+
 	if err := run(); err != nil {
 		slog.Error("api exited with an error", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+// probeSelf performs the container healthcheck and returns a process exit code.
+func probeSelf() int {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+
+	// A listen address is commonly written as ":8080", which is not a valid
+	// host to dial.
+	addr := cfg.HTTPAddr
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + addr + "/health") //nolint:noctx // the client timeout is the deadline
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: /health returned %d\n", resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 // run exists so that main can exit non-zero without skipping cleanup:

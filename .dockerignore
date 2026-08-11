@@ -1,0 +1,34 @@
+# The build context is uploaded to the daemon on every build. Everything the
+# compiler does not read belongs out of it.
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Never let a local .env reach an image layer.
+.env
+.env.*
+!.env.example
+
+# Documentation and assets the build does not consume.
+*.md
+!README.md
+docs/
+enunciado_bilheteira_*.pdf
+enunciado_bilheteira_*.docx
+
+# Build and test output
+bin/
+dist/
+*.exe
+*.test
+coverage.out
+coverage.html
+loadtest/results/
+
+# Editors and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
