@@ -1,0 +1,28 @@
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One pull request a week rather than one per module. Ungrouped updates
+      # on a small project produce more review noise than they prevent.
+      go-modules:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Base images age badly: the runtime stage is rebuilt from whatever
+  # distroless currently ships, and nothing else in the repository would
+  # notice a CVE in it.
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
