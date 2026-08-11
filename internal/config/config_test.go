@@ -37,6 +37,8 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("REDIS_PASSWORD", "hunter2")
 	t.Setenv("SHUTDOWN_TIMEOUT", "45s")
 	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("CAMPAIGN_ID", "noites-do-parque")
+	t.Setenv("TOTAL_TICKETS", "250")
 
 	cfg, err := Load()
 	if err != nil {
@@ -50,6 +52,8 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 		RedisPassword:   "hunter2",
 		ShutdownTimeout: 45 * time.Second,
 		LogLevel:        slog.LevelDebug,
+		CampaignID:      "noites-do-parque",
+		TotalTickets:    250,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v, want %+v", cfg, want)
@@ -93,6 +97,7 @@ func TestUnparseableValuesAreRejectedAndNameTheirVariable(t *testing.T) {
 	}{
 		{name: "duration", key: "SHUTDOWN_TIMEOUT", value: "quite a while"},
 		{name: "log level", key: "LOG_LEVEL", value: "chatty"},
+		{name: "integer", key: "TOTAL_TICKETS", value: "one hundred"},
 	}
 
 	for _, tc := range tests {
@@ -132,6 +137,21 @@ func TestEveryProblemIsReportedInOnePass(t *testing.T) {
 	}
 }
 
+// A campaign with no tickets is not a campaign. Letting zero through would
+// produce a service that starts happily and refuses every purchase as sold out.
+func TestNonPositiveTicketCountIsRejected(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("TOTAL_TICKETS", value)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() accepted TOTAL_TICKETS=%s", value)
+			}
+		})
+	}
+}
+
 func TestNonPositiveShutdownTimeoutIsRejected(t *testing.T) {
 	clearEnv(t)
 	// Zero would make graceful shutdown a no-op, quietly turning every
@@ -155,6 +175,8 @@ func clearEnv(t *testing.T) {
 		"REDIS_PASSWORD",
 		"SHUTDOWN_TIMEOUT",
 		"LOG_LEVEL",
+		"CAMPAIGN_ID",
+		"TOTAL_TICKETS",
 	} {
 		t.Setenv(key, "")
 	}
