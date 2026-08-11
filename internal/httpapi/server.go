@@ -31,24 +31,47 @@ type Config struct {
 	Purchaser  Purchaser
 	CampaignID string
 	Logger     *slog.Logger
+
+	// Limiter and the two policies below are optional: a zero Policy
+	// disables its check, which keeps the handler tests free of a Redis
+	// they are not testing.
+	Limiter   Limiter
+	UserLimit Policy
+	IPLimit   Policy
+
+	// RateLimitKey names a caller's bucket. Injected so that the transport
+	// layer does not have to know how the cache namespaces its keys.
+	RateLimitKey func(scope, id string) string
 }
 
 // Server holds the dependencies shared by every handler.
 type Server struct {
-	health     *health.Checker
-	purchaser  Purchaser
-	campaignID string
-	logger     *slog.Logger
+	health       *health.Checker
+	purchaser    Purchaser
+	campaignID   string
+	logger       *slog.Logger
+	limiter      Limiter
+	userLimit    Policy
+	ipLimit      Policy
+	rateLimitKey func(scope, id string) string
 }
 
 // New builds a Server.
 func New(cfg Config) *Server {
-	return &Server{
-		health:     cfg.Health,
-		purchaser:  cfg.Purchaser,
-		campaignID: cfg.CampaignID,
-		logger:     cfg.Logger,
+	s := &Server{
+		health:       cfg.Health,
+		purchaser:    cfg.Purchaser,
+		campaignID:   cfg.CampaignID,
+		logger:       cfg.Logger,
+		limiter:      cfg.Limiter,
+		userLimit:    cfg.UserLimit,
+		ipLimit:      cfg.IPLimit,
+		rateLimitKey: cfg.RateLimitKey,
 	}
+	if s.rateLimitKey == nil {
+		s.rateLimitKey = func(scope, id string) string { return scope + ":" + id }
+	}
+	return s
 }
 
 // Routes returns the HTTP handler for the whole API.
@@ -61,8 +84,11 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /health", s.handleHealth)
 	// Identity is required for the purchase path and meaningless for health,
-	// so the middleware wraps the one route rather than the whole mux.
-	mux.Handle("POST /api/v1/tickets/purchase", withIdentity(http.HandlerFunc(s.handlePurchase)))
+	// so the middleware wraps the one route rather than the whole mux. The
+	// rate limit sits inside the identity check, which is what lets it key
+	// on the caller as well as on the address — see withRateLimit.
+	mux.Handle("POST /api/v1/tickets/purchase",
+		withIdentity(s.withRateLimit(http.HandlerFunc(s.handlePurchase))))
 
 	return mux
 }
