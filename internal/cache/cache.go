@@ -26,6 +26,8 @@ var (
 	purchaseScriptSrc string
 	//go:embed scripts/release.lua
 	releaseScriptSrc string
+	//go:embed scripts/reconcile.lua
+	reconcileScriptSrc string
 )
 
 // Cache is a handle on the Redis client and the scripts it runs.
@@ -37,8 +39,9 @@ type Cache struct {
 	// server lifetime instead of once per purchase. It also recovers by
 	// itself from a SCRIPT FLUSH or a failover onto a replica that never saw
 	// the script, which is the failure mode of caching the SHA by hand.
-	purchase *redis.Script
-	release  *redis.Script
+	purchase  *redis.Script
+	release   *redis.Script
+	reconcile *redis.Script
 }
 
 // Open prepares a Redis client.
@@ -52,8 +55,9 @@ func Open(addr, password string) *Cache {
 			Addr:     addr,
 			Password: password,
 		}),
-		purchase: redis.NewScript(purchaseScriptSrc),
-		release:  redis.NewScript(releaseScriptSrc),
+		purchase:  redis.NewScript(purchaseScriptSrc),
+		release:   redis.NewScript(releaseScriptSrc),
+		reconcile: redis.NewScript(reconcileScriptSrc),
 	}
 }
 
