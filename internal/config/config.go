@@ -40,6 +40,14 @@ type Config struct {
 	CampaignID   string
 	TotalTickets int
 
+	// RateLimitWindow is the period both limits below are measured over,
+	// and RateLimitUser and RateLimitIP are how many purchase attempts one
+	// account and one address may make within it. Either limit set to zero
+	// disables that check.
+	RateLimitWindow time.Duration
+	RateLimitUser   int
+	RateLimitIP     int
+
 	// LogLevel is the minimum level emitted by the structured logger.
 	LogLevel slog.Level
 }
@@ -65,6 +73,25 @@ const (
 	defaultCampaignID  = "queima-2026"
 	// The brief's campaign: 100 tickets at 80% off.
 	defaultTotalTickets = 100
+
+	defaultRateLimitWindow = 10 * time.Second
+	// Five attempts in ten seconds is far above what pressing a button
+	// produces and far below what a script produces. The limit exists to
+	// stop one account retrying in a loop, not to police impatience.
+	defaultRateLimitUser = 5
+	// The address limit is deliberately loose. The campaign's audience is a
+	// university, where thousands of students share a handful of NAT
+	// addresses, so a tight per-IP limit does not stop an attacker — it
+	// stops a hall of residence. It is set to absorb the entire expected
+	// burst from one address and catch only a single machine going orders
+	// of magnitude beyond human speed.
+	//
+	// This interacts with the load test, which drives every virtual user
+	// from one container and therefore one address: raise VUS above this
+	// and the generator starts rate limiting itself. That is the limiter
+	// working, and the k6 output counts the two refusal reasons separately
+	// so the difference is visible rather than mysterious.
+	defaultRateLimitIP = 1000
 )
 
 // Load reads configuration from the process environment.
@@ -84,6 +111,9 @@ func Load() (Config, error) {
 		LogLevel:        levelVar("LOG_LEVEL", defaultLogLevel, &errs),
 		CampaignID:      stringVar("CAMPAIGN_ID", defaultCampaignID),
 		TotalTickets:    intVar("TOTAL_TICKETS", defaultTotalTickets, &errs),
+		RateLimitWindow: durationVar("RATE_LIMIT_WINDOW", defaultRateLimitWindow, &errs),
+		RateLimitUser:   intVar("RATE_LIMIT_USER", defaultRateLimitUser, &errs),
+		RateLimitIP:     intVar("RATE_LIMIT_IP", defaultRateLimitIP, &errs),
 	}
 
 	errs = append(errs, cfg.validate()...)
@@ -116,6 +146,18 @@ func (c Config) validate() []error {
 	// pass the schema's own CHECK only by accident.
 	if c.TotalTickets <= 0 {
 		errs = append(errs, fmt.Errorf("TOTAL_TICKETS must be positive, got %d", c.TotalTickets))
+	}
+	// Zero disables a limit, which is a legitimate choice. A negative one is
+	// a typo that would read as "disabled" and silently remove a control
+	// somebody believed was on.
+	if c.RateLimitUser < 0 {
+		errs = append(errs, fmt.Errorf("RATE_LIMIT_USER must not be negative, got %d", c.RateLimitUser))
+	}
+	if c.RateLimitIP < 0 {
+		errs = append(errs, fmt.Errorf("RATE_LIMIT_IP must not be negative, got %d", c.RateLimitIP))
+	}
+	if c.RateLimitWindow <= 0 {
+		errs = append(errs, fmt.Errorf("RATE_LIMIT_WINDOW must be positive, got %s", c.RateLimitWindow))
 	}
 
 	return errs
