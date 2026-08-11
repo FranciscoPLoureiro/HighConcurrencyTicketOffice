@@ -28,6 +28,8 @@ var (
 	releaseScriptSrc string
 	//go:embed scripts/reconcile.lua
 	reconcileScriptSrc string
+	//go:embed scripts/ratelimit.lua
+	rateLimitScriptSrc string
 	//go:embed scripts/unlock.lua
 	unlockScriptSrc string
 )
@@ -44,6 +46,7 @@ type Cache struct {
 	purchase  *redis.Script
 	release   *redis.Script
 	reconcile *redis.Script
+	rateLimit *redis.Script
 	unlock    *redis.Script
 }
 
@@ -61,6 +64,7 @@ func Open(addr, password string) *Cache {
 		purchase:  redis.NewScript(purchaseScriptSrc),
 		release:   redis.NewScript(releaseScriptSrc),
 		reconcile: redis.NewScript(reconcileScriptSrc),
+		rateLimit: redis.NewScript(rateLimitScriptSrc),
 		unlock:    redis.NewScript(unlockScriptSrc),
 	}
 }
