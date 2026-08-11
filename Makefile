@@ -6,7 +6,20 @@
 
 GO_IMAGE   ?= golang:1.26
 LINT_IMAGE ?= golangci/golangci-lint:v2.12.2-alpine
-COMPOSE    ?= docker compose
+# Docker Desktop installs a `docker` *shell script* next to docker.exe, for the
+# benefit of WSL users, and an MSYS shell finds the extensionless script first.
+# The script re-execs docker.exe, and MSYS_NO_PATHCONV below does not survive
+# that hop, so every path argument is rewritten behind our back: `-w /src`
+# becomes `-w C:/Program Files/Git/src`, and `-v host:/src` loses its colon and
+# degrades into an anonymous volume — which mounts an *empty* directory and
+# fails with "directory prefix . does not contain main module" rather than
+# anything that points at the cause. Naming the executable skips the script.
+#
+# MSYSTEM is the signal rather than OS: it is set by exactly the shells that
+# have the script on their PATH, and msys2's make unsets OS before the makefile
+# is parsed. Elsewhere — Linux, macOS, PowerShell — plain `docker` is correct.
+DOCKER     ?= $(if $(MSYSTEM),docker.exe,docker)
+COMPOSE    ?= $(DOCKER) compose
 K6         ?= k6
 K6_IMAGE   ?= grafana/k6:latest
 API_URL    ?= http://localhost:8080
@@ -31,7 +44,7 @@ export MSYS_NO_PATHCONV := 1
 # test cycle.
 #
 # Set GO_LOCAL=1 to use a host toolchain instead: `make test GO_LOCAL=1`.
-DOCKER_RUN = docker run --rm \
+DOCKER_RUN = $(DOCKER) run --rm \
 	-v "$(CURDIR)":/src -w /src \
 	-v ticket-office-gomod:/go/pkg/mod \
 	-v ticket-office-gobuild:/root/.cache/go-build
@@ -134,7 +147,7 @@ load-test-campaign-internal: ## Campaign load test from inside the docker networ
 	# share of connections in a burst — at 500 virtual users it dropped 57% of
 	# them before the API saw anything. Running the generator on the same
 	# network measures the API instead of the host's port forwarding.
-	docker run --rm --network $(COMPOSE_NETWORK) \
+	$(DOCKER) run --rm --network $(COMPOSE_NETWORK) \
 		-v "$(CURDIR)/loadtest":/loadtest \
 		-e BASE_URL=http://api:8080 -e VUS=$(VUS) \
 		$(K6_IMAGE) run /loadtest/campaign.js
