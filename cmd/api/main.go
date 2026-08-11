@@ -35,6 +35,38 @@ func main() {
 	}
 }
 
+// migrationBudget bounds how long startup waits for a database that is not yet
+// accepting connections before giving up and letting the platform restart us.
+const migrationBudget = 30 * time.Second
+
+// migrate applies the schema, retrying while the database is still coming up.
+func migrate(ctx context.Context, db *store.Store, logger *slog.Logger) (int64, error) {
+	deadline := time.Now().Add(migrationBudget)
+
+	for attempt := 1; ; attempt++ {
+		version, err := db.Migrate(ctx)
+		if err == nil {
+			return version, nil
+		}
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("after %s and %d attempts: %w", migrationBudget, attempt, err)
+		}
+
+		logger.Warn("migration attempt failed, retrying",
+			slog.Int("attempt", attempt),
+			slog.Any("error", err))
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 // probeSelf performs the container healthcheck and returns a process exit code.
 func probeSelf() int {
 	cfg, err := config.Load()
@@ -87,6 +119,21 @@ func run() error {
 		return fmt.Errorf("open postgres: %w", err)
 	}
 	defer db.Close()
+
+	// Unlike the health probes, this does block startup: a process with no
+	// schema cannot serve anything, so there is nothing to stay up for. It
+	// retries rather than exiting on the first failure because a rolling
+	// deploy routinely starts the app seconds before the database begins
+	// accepting connections, and a crash loop there is noise, not signal.
+	version, err := migrate(ctx, db, logger)
+	if err != nil {
+		return fmt.Errorf("migrate schema: %w", err)
+	}
+	logger.Info("schema up to date", slog.Int64("version", version))
+
+	if err := db.EnsureCampaign(ctx, cfg.CampaignID, cfg.TotalTickets); err != nil {
+		return fmt.Errorf("ensure campaign: %w", err)
+	}
 
 	redis := cache.Open(cfg.RedisAddr, cfg.RedisPassword)
 	defer func() {
