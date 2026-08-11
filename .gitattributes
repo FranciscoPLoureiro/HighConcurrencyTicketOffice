@@ -1,2 +1,21 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Files that are read by Linux tooling must keep LF even when checked out on
+# Windows. The Docker build context is the working tree, so a CRLF shell script
+# copied into an image fails with "bad interpreter", and a CRLF recipe line
+# breaks GNU make. Checking out these with CRLF is a build failure, not a
+# cosmetic difference.
+*.sh            text eol=lf
+*.lua           text eol=lf
+*.sql           text eol=lf
+Makefile        text eol=lf
+Dockerfile      text eol=lf
+Dockerfile.*    text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Binary assets: never normalise, never diff as text.
+*.png           binary
+*.jpg           binary
+*.pdf           binary
