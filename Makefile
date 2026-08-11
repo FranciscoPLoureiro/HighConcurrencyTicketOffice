@@ -8,7 +8,13 @@ GO_IMAGE   ?= golang:1.26
 LINT_IMAGE ?= golangci/golangci-lint:v2.12.2-alpine
 COMPOSE    ?= docker compose
 K6         ?= k6
+K6_IMAGE   ?= grafana/k6:latest
 API_URL    ?= http://localhost:8080
+# Compose derives this from the project name in docker-compose.yml.
+COMPOSE_NETWORK ?= ticket-office_default
+# Virtual users for the campaign load test. Must exceed the campaign size to
+# put the stock under real contention.
+VUS        ?= 500
 
 # On Windows, make runs recipes through Git's MSYS shell, which helpfully
 # rewrites anything that looks like a Unix path into a Windows one before the
@@ -115,5 +121,20 @@ verify: fmt tidy build lint test ## Everything CI runs, in the same order
 ## --- load testing ----------------------------------------------------------
 
 .PHONY: load-test
-load-test: ## Run the k6 load test against a running stack
+load-test: ## Run the k6 smoke test against a running stack
 	$(K6) run -e BASE_URL=$(API_URL) loadtest/smoke.js
+
+.PHONY: load-test-campaign
+load-test-campaign: ## Campaign load test from the host (use after `make reset`)
+	$(K6) run -e BASE_URL=$(API_URL) -e VUS=$(VUS) loadtest/campaign.js
+
+.PHONY: load-test-campaign-internal
+load-test-campaign-internal: ## Campaign load test from inside the docker network
+	# On Docker Desktop for Windows the published-port proxy refuses a large
+	# share of connections in a burst — at 500 virtual users it dropped 57% of
+	# them before the API saw anything. Running the generator on the same
+	# network measures the API instead of the host's port forwarding.
+	docker run --rm --network $(COMPOSE_NETWORK) \
+		-v "$(CURDIR)/loadtest":/loadtest \
+		-e BASE_URL=http://api:8080 -e VUS=$(VUS) \
+		$(K6_IMAGE) run /loadtest/campaign.js
