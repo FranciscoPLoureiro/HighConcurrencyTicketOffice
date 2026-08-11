@@ -46,9 +46,14 @@ type Config struct {
 const (
 	defaultHTTPAddr        = ":8080"
 	defaultShutdownTimeout = 15 * time.Second
-	defaultPostgresDSN     = "postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable"
-	defaultRedisAddr       = "localhost:6379"
-	defaultLogLevel        = slog.LevelInfo
+	// gosec flags the inline password (G101) and it is right to: a
+	// credential in source is normally a real finding. It is accepted here
+	// because this exact pair is the one docker-compose creates for a
+	// throwaway local database, no deployment ever reads it, and the
+	// alternative — no default — costs every newcomer a broken first run.
+	defaultPostgresDSN = "postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable" //nolint:gosec // G101: documented development default, see above
+	defaultRedisAddr   = "localhost:6379"
+	defaultLogLevel    = slog.LevelInfo
 )
 
 // Load reads configuration from the process environment.

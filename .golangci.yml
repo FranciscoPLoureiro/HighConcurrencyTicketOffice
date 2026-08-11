@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    # This project's failure modes are leaked resources and swallowed errors
+    # under concurrency, so the additions are weighted towards those rather
+    # than towards style.
+    - bodyclose # an unclosed response body leaks a connection from the pool
+    - errorlint # == on errors breaks the moment something wraps them
+    - gosec # the repository is public; obvious weaknesses should not be
+    - misspell
+    - nilerr # returning nil after a non-nil error hides real failures
+    - noctx # an HTTP call with no context cannot be cancelled or bounded
+    - revive
+    - unconvert
+    - wastedassign
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          # Exported identifiers carry the explanation of why they exist.
+          disabled: false
+
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          # Test fixtures are not attack surface, and a test's own timeout
+          # is a perfectly good deadline.
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

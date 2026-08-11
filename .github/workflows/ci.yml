@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A run whose commit has already been superseded tells nobody anything and
+# occupies a runner that the current commit needs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default. A job that needs more asks for it explicitly.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: build, lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Read the version from go.mod so the toolchain can never drift
+          # away from what the module declares.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod is tidy
+        # A stale go.mod passes locally and fails for the next person to
+        # clone. Cheaper to catch here than in someone else's checkout.
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned rather than "latest": a new release adding a check should
+          # be a deliberate commit, not a build that breaks on a Tuesday.
+          version: v2.12.2
+
+      - name: Test
+        # -race is the entire point of this pipeline for a project about
+        # concurrency. -shuffle=on catches tests that only pass because of
+        # the order they happen to run in.
+        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -n 1
+
+  image:
+    name: build container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Plain docker build rather than a marketplace action: the runner
+      # already has Docker, and this cannot break on an action's major bump.
+      - name: Build the api image
+        run: docker build -f docker/api.Dockerfile -t ticket-office-api:ci .
