@@ -30,12 +30,24 @@ DOCKER_RUN = docker run --rm \
 	-v ticket-office-gomod:/go/pkg/mod \
 	-v ticket-office-gobuild:/root/.cache/go-build
 
+# Integration tests start real containers through Testcontainers. From inside
+# the toolchain container that needs three things: the host's Docker socket, a
+# route back to the host, and TESTCONTAINERS_HOST_OVERRIDE so the library
+# reaches the sibling containers it starts by their published ports on the host
+# rather than by an address only the daemon can see.
+DOCKER_RUN_TC = $(DOCKER_RUN) \
+	-v /var/run/docker.sock:/var/run/docker.sock \
+	--add-host host.docker.internal:host-gateway \
+	-e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal
+
 ifdef GO_LOCAL
-GO   = go
-LINT = golangci-lint
+GO             = go
+GO_INTEGRATION = go
+LINT           = golangci-lint
 else
-GO   = $(DOCKER_RUN) $(GO_IMAGE) go
-LINT = $(DOCKER_RUN) -v ticket-office-golangci:/root/.cache/golangci-lint $(LINT_IMAGE) golangci-lint
+GO             = $(DOCKER_RUN) $(GO_IMAGE) go
+GO_INTEGRATION = $(DOCKER_RUN_TC) $(GO_IMAGE) go
+LINT           = $(DOCKER_RUN) -v ticket-office-golangci:/root/.cache/golangci-lint $(LINT_IMAGE) golangci-lint
 endif
 
 .PHONY: help
@@ -73,8 +85,12 @@ build: ## Compile every package
 	$(GO) build ./...
 
 .PHONY: test
-test: ## Run the tests with the race detector
+test: ## Run the unit tests with the race detector
 	$(GO) test -race -shuffle=on ./...
+
+.PHONY: integration-test
+integration-test: ## Run the integration tests against real containers
+	$(GO_INTEGRATION) test -race -shuffle=on -tags=integration -timeout 600s ./...
 
 .PHONY: cover
 cover: ## Run the tests and print total coverage
