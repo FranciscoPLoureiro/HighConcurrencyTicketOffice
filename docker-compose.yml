@@ -1,0 +1,73 @@
+# Local development stack.
+#
+# The credentials here are throwaway development values, committed on purpose so
+# that a fresh clone runs with no setup. A deployment supplies every one of them
+# through the environment and shares none of these defaults.
+name: ticket-office
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: tickets
+      POSTGRES_PASSWORD: tickets
+      POSTGRES_DB: tickets
+    ports:
+      # Published so the API can also be run straight from the host with
+      # `go run ./cmd/api`, and so integration tests can reach it directly.
+      - "5432:5432"
+    volumes:
+      # Postgres 18 images store data in a major-version subdirectory so that
+      # `pg_upgrade --link` works without crossing a mount boundary. Mounting
+      # the older /var/lib/postgresql/data path makes the container refuse to
+      # start rather than silently ignore the volume.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # Postgres starts, shuts down and restarts once during first-run
+      # initialisation. Without a real readiness probe, anything depending on
+      # it connects during that window and fails on an otherwise fine stack.
+      test: ["CMD-SHELL", "pg_isready -U tickets -d tickets"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: tickets
+      RABBITMQ_DEFAULT_PASS: tickets
+    ports:
+      - "5672:5672"
+      # Management UI. Useful for watching queue depth and the dead letter
+      # queue by hand while developing phase 3.
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      # The Erlang VM takes far longer to become useful than the other two.
+      # A short start_period here marks the whole stack unhealthy on a cold
+      # boot of a machine that is doing nothing wrong.
+      retries: 10
+      start_period: 40s
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
