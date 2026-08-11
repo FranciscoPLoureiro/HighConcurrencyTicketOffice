@@ -2,6 +2,11 @@ version: "2"
 
 run:
   timeout: 5m
+  # Without this the integration tests are invisible to every linter, which is
+  # the opposite of what should happen: they are the files that touch real
+  # connections and real containers.
+  build-tags:
+    - integration
 
 linters:
   default: standard

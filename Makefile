@@ -8,7 +8,13 @@ GO_IMAGE   ?= golang:1.26
 LINT_IMAGE ?= golangci/golangci-lint:v2.12.2-alpine
 COMPOSE    ?= docker compose
 K6         ?= k6
+K6_IMAGE   ?= grafana/k6:latest
 API_URL    ?= http://localhost:8080
+# Compose derives this from the project name in docker-compose.yml.
+COMPOSE_NETWORK ?= ticket-office_default
+# Virtual users for the campaign load test. Must exceed the campaign size to
+# put the stock under real contention.
+VUS        ?= 500
 
 # On Windows, make runs recipes through Git's MSYS shell, which helpfully
 # rewrites anything that looks like a Unix path into a Windows one before the
@@ -30,12 +36,24 @@ DOCKER_RUN = docker run --rm \
 	-v ticket-office-gomod:/go/pkg/mod \
 	-v ticket-office-gobuild:/root/.cache/go-build
 
+# Integration tests start real containers through Testcontainers. From inside
+# the toolchain container that needs three things: the host's Docker socket, a
+# route back to the host, and TESTCONTAINERS_HOST_OVERRIDE so the library
+# reaches the sibling containers it starts by their published ports on the host
+# rather than by an address only the daemon can see.
+DOCKER_RUN_TC = $(DOCKER_RUN) \
+	-v /var/run/docker.sock:/var/run/docker.sock \
+	--add-host host.docker.internal:host-gateway \
+	-e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal
+
 ifdef GO_LOCAL
-GO   = go
-LINT = golangci-lint
+GO             = go
+GO_INTEGRATION = go
+LINT           = golangci-lint
 else
-GO   = $(DOCKER_RUN) $(GO_IMAGE) go
-LINT = $(DOCKER_RUN) -v ticket-office-golangci:/root/.cache/golangci-lint $(LINT_IMAGE) golangci-lint
+GO             = $(DOCKER_RUN) $(GO_IMAGE) go
+GO_INTEGRATION = $(DOCKER_RUN_TC) $(GO_IMAGE) go
+LINT           = $(DOCKER_RUN) -v ticket-office-golangci:/root/.cache/golangci-lint $(LINT_IMAGE) golangci-lint
 endif
 
 .PHONY: help
@@ -73,8 +91,12 @@ build: ## Compile every package
 	$(GO) build ./...
 
 .PHONY: test
-test: ## Run the tests with the race detector
+test: ## Run the unit tests with the race detector
 	$(GO) test -race -shuffle=on ./...
+
+.PHONY: integration-test
+integration-test: ## Run the integration tests against real containers
+	$(GO_INTEGRATION) test -race -shuffle=on -tags=integration -timeout 600s ./...
 
 .PHONY: cover
 cover: ## Run the tests and print total coverage
@@ -99,5 +121,20 @@ verify: fmt tidy build lint test ## Everything CI runs, in the same order
 ## --- load testing ----------------------------------------------------------
 
 .PHONY: load-test
-load-test: ## Run the k6 load test against a running stack
+load-test: ## Run the k6 smoke test against a running stack
 	$(K6) run -e BASE_URL=$(API_URL) loadtest/smoke.js
+
+.PHONY: load-test-campaign
+load-test-campaign: ## Campaign load test from the host (use after `make reset`)
+	$(K6) run -e BASE_URL=$(API_URL) -e VUS=$(VUS) loadtest/campaign.js
+
+.PHONY: load-test-campaign-internal
+load-test-campaign-internal: ## Campaign load test from inside the docker network
+	# On Docker Desktop for Windows the published-port proxy refuses a large
+	# share of connections in a burst — at 500 virtual users it dropped 57% of
+	# them before the API saw anything. Running the generator on the same
+	# network measures the API instead of the host's port forwarding.
+	docker run --rm --network $(COMPOSE_NETWORK) \
+		-v "$(CURDIR)/loadtest":/loadtest \
+		-e BASE_URL=http://api:8080 -e VUS=$(VUS) \
+		$(K6_IMAGE) run /loadtest/campaign.js

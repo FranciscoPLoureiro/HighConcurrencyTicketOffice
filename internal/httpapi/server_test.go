@@ -13,7 +13,10 @@ import (
 )
 
 func testRoutes(probes ...health.Probe) http.Handler {
-	return New(health.New(probes...), slog.New(slog.DiscardHandler)).Routes()
+	return New(Config{
+		Health: health.New(probes...),
+		Logger: slog.New(slog.DiscardHandler),
+	}).Routes()
 }
 
 func get(t *testing.T, handler http.Handler, path string) *httptest.ResponseRecorder {

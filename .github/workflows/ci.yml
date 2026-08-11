@@ -57,6 +57,26 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -n 1
 
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    # Real containers are slower to start than the unit suite, which is why
+    # these live behind a build tag and in their own job. They still run on
+    # every push: an integration suite that is skipped is not a suite.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Integration tests
+        # The runner provides Docker directly, so Testcontainers needs none
+        # of the socket plumbing the local Makefile target sets up.
+        run: go test -race -shuffle=on -tags=integration -timeout 900s ./...
+
   image:
     name: build container image
     runs-on: ubuntu-latest

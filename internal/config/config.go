@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,13 @@ type Config struct {
 	// RedisAddr and RedisPassword address the cache that guards the stock.
 	RedisAddr     string
 	RedisPassword string
+
+	// CampaignID names the campaign this process serves, and TotalTickets
+	// is how many exist. The campaign row is created from these once and
+	// never reset, so changing TotalTickets does not resize a campaign that
+	// has already started selling.
+	CampaignID   string
+	TotalTickets int
 
 	// LogLevel is the minimum level emitted by the structured logger.
 	LogLevel slog.Level
@@ -54,6 +62,9 @@ const (
 	defaultPostgresDSN = "postgres://tickets:tickets@localhost:5432/tickets?sslmode=disable" //nolint:gosec // G101: documented development default, see above
 	defaultRedisAddr   = "localhost:6379"
 	defaultLogLevel    = slog.LevelInfo
+	defaultCampaignID  = "queima-2026"
+	// The brief's campaign: 100 tickets at 80% off.
+	defaultTotalTickets = 100
 )
 
 // Load reads configuration from the process environment.
@@ -71,6 +82,8 @@ func Load() (Config, error) {
 		RedisPassword:   stringVar("REDIS_PASSWORD", ""),
 		ShutdownTimeout: durationVar("SHUTDOWN_TIMEOUT", defaultShutdownTimeout, &errs),
 		LogLevel:        levelVar("LOG_LEVEL", defaultLogLevel, &errs),
+		CampaignID:      stringVar("CAMPAIGN_ID", defaultCampaignID),
+		TotalTickets:    intVar("TOTAL_TICKETS", defaultTotalTickets, &errs),
 	}
 
 	errs = append(errs, cfg.validate()...)
@@ -95,6 +108,14 @@ func (c Config) validate() []error {
 	// no-op, silently turning every deploy into a hard kill of in-flight work.
 	if c.ShutdownTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive, got %s", c.ShutdownTimeout))
+	}
+	if c.CampaignID == "" {
+		errs = append(errs, errors.New("CAMPAIGN_ID must not be empty"))
+	}
+	// A campaign with no tickets is not a campaign, and a negative one would
+	// pass the schema's own CHECK only by accident.
+	if c.TotalTickets <= 0 {
+		errs = append(errs, fmt.Errorf("TOTAL_TICKETS must be positive, got %d", c.TotalTickets))
 	}
 
 	return errs
@@ -140,4 +161,18 @@ func levelVar(key string, fallback slog.Level, errs *[]error) slog.Level {
 		return fallback
 	}
 	return level
+}
+
+func intVar(key string, fallback int, errs *[]error) int {
+	raw := stringVar(key, "")
+	if raw == "" {
+		return fallback
+	}
+
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s: %q is not an integer: %w", key, raw, err))
+		return fallback
+	}
+	return n
 }

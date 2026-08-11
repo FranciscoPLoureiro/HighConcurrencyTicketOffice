@@ -15,6 +15,7 @@ import (
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/config"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/health"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/httpapi"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
@@ -32,6 +33,50 @@ func main() {
 	if err := run(); err != nil {
 		slog.Error("api exited with an error", slog.Any("error", err))
 		os.Exit(1)
+	}
+}
+
+// naivePurchaser adapts the phase 1 storage method to the handler's interface.
+//
+// This is the seam the project turns on. Phase 2 replaces this one type with
+// the Redis-backed purchaser and nothing in the transport layer changes, which
+// is what makes the before-and-after measurement a fair comparison: the same
+// handler, the same routes, the same client.
+type naivePurchaser struct{ *store.Store }
+
+func (p naivePurchaser) Purchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error) {
+	return p.PurchaseNaively(ctx, campaignID, userID)
+}
+
+// migrationBudget bounds how long startup waits for a database that is not yet
+// accepting connections before giving up and letting the platform restart us.
+const migrationBudget = 30 * time.Second
+
+// migrate applies the schema, retrying while the database is still coming up.
+func migrate(ctx context.Context, db *store.Store, logger *slog.Logger) (int64, error) {
+	deadline := time.Now().Add(migrationBudget)
+
+	for attempt := 1; ; attempt++ {
+		version, err := db.Migrate(ctx)
+		if err == nil {
+			return version, nil
+		}
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("after %s and %d attempts: %w", migrationBudget, attempt, err)
+		}
+
+		logger.Warn("migration attempt failed, retrying",
+			slog.Int("attempt", attempt),
+			slog.Any("error", err))
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 
@@ -88,6 +133,21 @@ func run() error {
 	}
 	defer db.Close()
 
+	// Unlike the health probes, this does block startup: a process with no
+	// schema cannot serve anything, so there is nothing to stay up for. It
+	// retries rather than exiting on the first failure because a rolling
+	// deploy routinely starts the app seconds before the database begins
+	// accepting connections, and a crash loop there is noise, not signal.
+	version, err := migrate(ctx, db, logger)
+	if err != nil {
+		return fmt.Errorf("migrate schema: %w", err)
+	}
+	logger.Info("schema up to date", slog.Int64("version", version))
+
+	if err := db.EnsureCampaign(ctx, cfg.CampaignID, cfg.TotalTickets); err != nil {
+		return fmt.Errorf("ensure campaign: %w", err)
+	}
+
 	redis := cache.Open(cfg.RedisAddr, cfg.RedisPassword)
 	defer func() {
 		if err := redis.Close(); err != nil {
@@ -101,8 +161,13 @@ func run() error {
 	)
 
 	srv := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: httpapi.New(checker, logger).Routes(),
+		Addr: cfg.HTTPAddr,
+		Handler: httpapi.New(httpapi.Config{
+			Health:     checker,
+			Purchaser:  naivePurchaser{db},
+			CampaignID: cfg.CampaignID,
+			Logger:     logger,
+		}).Routes(),
 		// Every timeout is set explicitly. The zero value for each of
 		// these is "no limit", which leaves a public listener one slow
 		// client away from holding a connection open indefinitely.
