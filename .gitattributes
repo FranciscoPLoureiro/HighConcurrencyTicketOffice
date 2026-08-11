@@ -6,6 +6,15 @@
 # copied into an image fails with "bad interpreter", and a CRLF recipe line
 # breaks GNU make. Checking out these with CRLF is a build failure, not a
 # cosmetic difference.
+#
+# Go sources belong on that list for the same reason, one step removed. The
+# toolchain runs inside a Linux container, gofmt writes LF unconditionally, and
+# it rewrites in place — so with `text=auto` alone a single `make fmt` on
+# Windows reports every file in the repository as modified, and `git status`
+# stops being a useful signal. gofmt is the formatter of record either way.
+*.go            text eol=lf
+go.mod          text eol=lf
+go.sum          text eol=lf
 *.sh            text eol=lf
 *.lua           text eol=lf
 *.sql           text eol=lf
