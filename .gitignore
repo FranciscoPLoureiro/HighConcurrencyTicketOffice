@@ -1,0 +1,31 @@
+# Compiled binaries
+/bin/
+/dist/
+*.exe
+*.test
+
+# Local environment. The committed .env.example carries placeholders only;
+# a real .env must never reach the history of a public repository.
+.env
+.env.*
+!.env.example
+
+# Load test output — regenerated on every run, large, and machine-specific.
+/loadtest/results/
+*.k6-summary.json
+
+# Coverage
+coverage.out
+coverage.html
+
+# The assignment brief. Kept on disk for reference, deliberately not published:
+# this repository presents a system, not a prescribed exercise.
+enunciado_bilheteira_*.pdf
+enunciado_bilheteira_*.docx
+
+# Editors and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
