@@ -401,16 +401,23 @@ func (s *Store) HasLiveTicket(ctx context.Context, campaignID, userID string) (b
 // Ordered oldest first, so a backlog is worked through in the order people have
 // been waiting, and limited so that one pass cannot pull an entire campaign
 // into memory.
+//
+// The age is passed as a number of seconds through make_interval rather than as
+// a duration string. Go renders durations in its own syntax — "2m0s", "1ns" —
+// and PostgreSQL rejects both: it has no unit "m", which is ambiguous between
+// minutes and months, and no concept of nanoseconds at all. The obvious
+// `$3::interval` therefore fails on the default configuration, not merely on
+// unusual values, and fails at the moment the sweeper is most needed.
 func (s *Store) StalledPurchases(ctx context.Context, campaignID string, olderThan time.Duration, limit int) ([]domain.Purchase, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+purchaseColumns+`
 		FROM purchases
 		WHERE campaign_id = $1
 		  AND status = $2
-		  AND updated_at < now() - $3::interval
+		  AND updated_at < now() - make_interval(secs => $3)
 		ORDER BY updated_at
 		LIMIT $4`,
-		campaignID, domain.StatusPending, olderThan.String(), limit)
+		campaignID, domain.StatusPending, olderThan.Seconds(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("read stalled purchases: %w", err)
 	}
