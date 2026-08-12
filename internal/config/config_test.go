@@ -52,6 +52,8 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("REDIS_TIMEOUT", "1s")
 	t.Setenv("POSTGRES_TIMEOUT", "3s")
 	t.Setenv("PUBLISH_TIMEOUT", "4s")
+	t.Setenv("METRICS_ADDR", ":9999")
+	t.Setenv("QUEUE_DEPTH_INTERVAL", "7s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -86,6 +88,9 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 		RedisTimeout:    time.Second,
 		PostgresTimeout: 3 * time.Second,
 		PublishTimeout:  4 * time.Second,
+
+		MetricsAddr:        ":9999",
+		QueueDepthInterval: 7 * time.Second,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v, want %+v", cfg, want)
@@ -243,6 +248,8 @@ func clearEnv(t *testing.T) {
 		"REDIS_TIMEOUT",
 		"POSTGRES_TIMEOUT",
 		"PUBLISH_TIMEOUT",
+		"METRICS_ADDR",
+		"QUEUE_DEPTH_INTERVAL",
 	} {
 		t.Setenv(key, "")
 	}

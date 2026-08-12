@@ -84,6 +84,15 @@ type Config struct {
 	PostgresTimeout time.Duration
 	PublishTimeout  time.Duration
 
+	// MetricsAddr is where the worker serves /metrics. The API serves its
+	// own on HTTPAddr alongside the routes, because it already has a
+	// listener and a second one would be a second thing to expose.
+	MetricsAddr string
+
+	// QueueDepthInterval is how often the worker asks the broker how deep
+	// each queue is.
+	QueueDepthInterval time.Duration
+
 	// LogLevel is the minimum level emitted by the structured logger.
 	LogLevel slog.Level
 }
@@ -172,6 +181,12 @@ const (
 	// A confirmed publish waits for the broker to fsync, so this covers a
 	// disk that is briefly busy rather than only the network.
 	defaultPublishTimeout = 5 * time.Second
+
+	defaultMetricsAddr = ":9090"
+	// Ten seconds is under Prometheus's default scrape interval, so every
+	// scrape sees a fresh value, and far above the cost of asking — a
+	// passive queue declare, four times over.
+	defaultQueueDepthInterval = 10 * time.Second
 )
 
 // Load reads configuration from the process environment.
@@ -207,6 +222,9 @@ func Load() (Config, error) {
 		RedisTimeout:    durationVar("REDIS_TIMEOUT", defaultRedisTimeout, &errs),
 		PostgresTimeout: durationVar("POSTGRES_TIMEOUT", defaultPostgresTimeout, &errs),
 		PublishTimeout:  durationVar("PUBLISH_TIMEOUT", defaultPublishTimeout, &errs),
+
+		MetricsAddr:        stringVar("METRICS_ADDR", defaultMetricsAddr),
+		QueueDepthInterval: durationVar("QUEUE_DEPTH_INTERVAL", defaultQueueDepthInterval, &errs),
 	}
 
 	errs = append(errs, cfg.validate()...)
@@ -290,6 +308,12 @@ func (c Config) validate() []error {
 		if budget.value <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be positive, got %s", budget.name, budget.value))
 		}
+	}
+	if c.MetricsAddr == "" {
+		errs = append(errs, errors.New("METRICS_ADDR must not be empty"))
+	}
+	if c.QueueDepthInterval <= 0 {
+		errs = append(errs, fmt.Errorf("QUEUE_DEPTH_INTERVAL must be positive, got %s", c.QueueDepthInterval))
 	}
 
 	return errs

@@ -52,6 +52,35 @@ type Fulfiller interface {
 	PublishTicket(ctx context.Context, message queue.TicketMessage) error
 }
 
+// Observer counts what the service decided.
+//
+// It lives here rather than in the transport because this is where the words
+// mean something. An HTTP layer can count 409s; only this package knows that a
+// 409 was "the campaign is empty" rather than "you already have one", and the
+// difference between those two numbers is the difference between a campaign
+// that sold out and one that is being hammered by retries.
+//
+// Optional. A nil Observer is what every test that is not about metrics uses.
+type Observer interface {
+	TicketSold()
+	TicketRejected(reason string)
+	Compensated(outcome string)
+}
+
+// The reasons a sale did not happen, as metric labels.
+//
+// Constants rather than strings at the call sites, because a typo in a label
+// does not fail anything — it silently starts a second time series that nobody
+// is graphing, and the graph that exists quietly stops counting.
+const (
+	reasonSoldOut       = "stock_exhausted"
+	reasonAlreadyHeld   = "already_purchased"
+	reasonUninitialised = "campaign_not_found"
+	reasonRecordFailed  = "record_failed"
+	reasonPublishFailed = "publish_failed"
+	reasonDeciderFailed = "decider_unavailable"
+)
+
 // Timeouts are the budgets each dependency gets inside one sale.
 //
 // Per call rather than one deadline over the whole thing, because the two say
@@ -83,7 +112,19 @@ type Service struct {
 	store     Recorder
 	fulfiller Fulfiller
 	timeouts  Timeouts
+	observer  Observer
 	logger    *slog.Logger
+}
+
+// WithObserver attaches metrics to a Service.
+//
+// A separate call rather than another constructor parameter: New already takes
+// five, metrics are optional everywhere they appear in this codebase, and a
+// sixth argument that is nil in every test is how the other five start getting
+// passed in the wrong order.
+func (s *Service) WithObserver(o Observer) *Service {
+	s.observer = o
+	return s
 }
 
 // New builds a Service.
@@ -129,15 +170,19 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID, idempotencyK
 		// enforced, so a purchase that cannot consult it is a purchase
 		// nobody can prove is safe. Selling anyway would trade a failed
 		// request for an oversold campaign.
+		s.rejected(reasonDeciderFailed)
 		return domain.Purchase{}, fmt.Errorf("decide purchase: %w", err)
 	}
 
 	switch outcome {
 	case cache.AlreadyHeld:
+		s.rejected(reasonAlreadyHeld)
 		return domain.Purchase{}, domain.ErrAlreadyPurchased
 	case cache.SoldOut:
+		s.rejected(reasonSoldOut)
 		return domain.Purchase{}, domain.ErrSoldOut
 	case cache.Uninitialised:
+		s.rejected(reasonUninitialised)
 		// Not a refusal — a system that has not been told what it is
 		// selling. Startup reconciliation is supposed to make this
 		// unreachable, so it is worth a loud line rather than a quiet 404.
@@ -162,6 +207,8 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID, idempotencyK
 		// Doing nothing costs at most one ticket that nobody can buy until
 		// the next reconciliation. That is the direction this system errs in
 		// everywhere else, and the only one of the two that is recoverable.
+		s.rejected(reasonRecordFailed)
+
 		if errors.Is(err, store.ErrOutcomeUnknown) {
 			s.logger.Error("purchase may or may not have been recorded, leaving the ticket out of circulation",
 				slog.String("campaign_id", campaignID),
@@ -175,7 +222,12 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID, idempotencyK
 	}
 
 	if err := s.handOver(ctx, purchase); err != nil {
+		s.rejected(reasonPublishFailed)
 		return domain.Purchase{}, err
+	}
+
+	if s.observer != nil {
+		s.observer.TicketSold()
 	}
 
 	s.logger.Debug("ticket sold",
@@ -277,6 +329,13 @@ func (s *Service) reverse(ctx context.Context, purchase domain.Purchase, cause e
 	s.compensate(ctx, purchase.CampaignID, purchase.UserID, cause)
 }
 
+// rejected counts a sale that did not happen, when anything is counting.
+func (s *Service) rejected(reason string) {
+	if s.observer != nil {
+		s.observer.TicketRejected(reason)
+	}
+}
+
 // compensate returns a ticket that Redis granted and PostgreSQL refused.
 //
 // Without this the ticket is decremented from a stock it will never leave: it
@@ -300,7 +359,16 @@ func (s *Service) compensate(ctx context.Context, campaignID, userID string, cau
 			slog.String("user_id", userID),
 			slog.Any("cause", cause),
 			slog.Any("error", err))
+		// The alerting one. A failed compensation means a ticket is out of
+		// circulation and nothing but the next reconciliation will notice.
+		if s.observer != nil {
+			s.observer.Compensated("failed")
+		}
 		return
+	}
+
+	if s.observer != nil {
+		s.observer.Compensated("released")
 	}
 
 	s.logger.Warn("returned a ticket after the purchase failed to record",

@@ -53,6 +53,16 @@ type Config struct {
 	// IdempotencyKey names a caller's record, for the same reason
 	// RateLimitKey is injected.
 	IdempotencyKey func(campaignID, userID, key string) string
+
+	// Observer records latency and outcome per route. Optional: a nil one
+	// turns the measurement off, which is what the handler tests use.
+	Observer Observer
+
+	// Metrics, when set, is exposed at /metrics. Separate from Observer
+	// because one is what the server reports and the other is where it
+	// reports it, and a process can do either without the other — the worker
+	// serves metrics and no routes at all.
+	Metrics http.Handler
 }
 
 // Server holds the dependencies shared by every handler.
@@ -68,6 +78,8 @@ type Server struct {
 	idempotency       IdempotencyStore
 	idempotencyPolicy IdempotencyPolicy
 	idempotencyKey    func(campaignID, userID, key string) string
+	observer          Observer
+	metrics           http.Handler
 }
 
 // New builds a Server.
@@ -84,6 +96,8 @@ func New(cfg Config) *Server {
 		idempotency:       cfg.Idempotency,
 		idempotencyPolicy: cfg.IdempotencyPolicy,
 		idempotencyKey:    cfg.IdempotencyKey,
+		observer:          cfg.Observer,
+		metrics:           cfg.Metrics,
 	}
 	if s.rateLimitKey == nil {
 		s.rateLimitKey = func(scope, id string) string { return scope + ":" + id }
@@ -104,7 +118,17 @@ func New(cfg Config) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", s.handleHealth)
+	// Measured but not logged. A container probe every five seconds is free
+	// to aggregate and seventeen thousand lines a day to narrate.
+	mux.Handle("GET /health", s.withObserver("/health", http.HandlerFunc(s.handleHealth)))
+
+	if s.metrics != nil {
+		// Deliberately unobserved. Scraping is not traffic, and counting it
+		// would put a request every fifteen seconds into the same histogram
+		// the purchase path is judged by — quietly pulling the percentiles
+		// towards whatever the scrape costs.
+		mux.Handle("GET /metrics", s.metrics)
+	}
 
 	// Every request gets a correlation id before anything else looks at it,
 	// including the ones that are about to be refused: "why did this caller
@@ -120,15 +144,28 @@ func (s *Server) Routes() http.Handler {
 	// enough that an honest client repeating a timed-out request is nowhere
 	// near it. The other order would make a claimed key the cheapest way to
 	// bypass the limiter.
+	// Correlation is outermost, so everything below it — including the
+	// access log and any line a refused request writes — carries the id.
+	// Wrapping it the other way round would leave the outer layers logging
+	// with a context that has no id in it yet.
 	mux.Handle("POST /api/v1/tickets/purchase",
-		withCorrelationID(withIdentity(s.withRateLimit(
-			s.withIdempotency(http.HandlerFunc(s.handlePurchase))))))
+		withCorrelationID(
+			s.withObserver("/api/v1/tickets/purchase",
+				s.withAccessLog("/api/v1/tickets/purchase",
+					withIdentity(s.withRateLimit(
+						s.withIdempotency(http.HandlerFunc(s.handlePurchase))))))))
 
 	// Where a caller watches the purchase the 202 promised them. No rate
 	// limit and no idempotency: it takes nothing, changes nothing, and
 	// polling it is the behaviour the 202 asked for.
+	// The route pattern, not the path. Labelling by path would mint a time
+	// series per purchase id, which is how a metrics backend is taken down
+	// some time after the incident it was meant to explain.
 	mux.Handle("GET /api/v1/tickets/{id}/status",
-		withCorrelationID(withIdentity(http.HandlerFunc(s.handlePurchaseStatus))))
+		withCorrelationID(
+			s.withObserver("/api/v1/tickets/{id}/status",
+				s.withAccessLog("/api/v1/tickets/{id}/status",
+					withIdentity(http.HandlerFunc(s.handlePurchaseStatus))))))
 
 	return mux
 }

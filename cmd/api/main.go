@@ -15,8 +15,10 @@ import (
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/config"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/correlation"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/health"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/httpapi"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/metrics"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/purchase"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/queue"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
@@ -212,8 +214,16 @@ func run() error {
 		return fmt.Errorf("load configuration: %w", err)
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	// The correlation handler wraps the JSON one, so every line written
+	// inside a request carries the id without any call site remembering to
+	// add it. The lines most worth correlating are the ones written in a
+	// hurry on a failure path, and those are exactly the ones that get
+	// forgotten.
+	logger := slog.New(correlation.NewHandler(
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})))
 	slog.SetDefault(logger)
+
+	telemetry := metrics.New()
 
 	// Signals are trapped before any dependency is opened so that a SIGTERM
 	// arriving mid-startup is still honoured. A deploy that rolls back
@@ -263,7 +273,7 @@ func run() error {
 		Redis:    cfg.RedisTimeout,
 		Postgres: cfg.PostgresTimeout,
 		Publish:  cfg.PublishTimeout,
-	}, logger)
+	}, logger).WithObserver(telemetry)
 
 	if err := prepare(ctx, cfg, db, sales, logger); err != nil {
 		return err
@@ -292,6 +302,8 @@ func run() error {
 				Retention: cfg.IdempotencyRetention,
 			},
 			IdempotencyKey: cache.IdempotencyKey,
+			Observer:       telemetry,
+			Metrics:        telemetry.Handler(),
 		}).Routes()),
 		// Every timeout is set explicitly. The zero value for each of
 		// these is "no limit", which leaves a public listener one slow

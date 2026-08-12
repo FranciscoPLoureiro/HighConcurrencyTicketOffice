@@ -1,0 +1,12 @@
+# Provisioned by file, so a fresh `docker compose up` has a working dashboard
+# with no clicking. The brief asks for exactly this, and it is also the
+# difference between a screenshot somebody can reproduce and one they cannot.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

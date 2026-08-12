@@ -18,6 +18,15 @@ services:
       LOG_LEVEL: info
     ports:
       - "8080:8080"
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
     depends_on:
       # Waiting on health rather than on start. The API tolerates a missing
       # dependency by design, but a stack that comes up reporting 503 for the
@@ -53,6 +62,15 @@ services:
       REDIS_ADDR: redis:6379
       RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
       LOG_LEVEL: info
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,6 +85,15 @@ services:
 
   postgres:
     image: postgres:18-alpine
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
     environment:
       POSTGRES_USER: tickets
       POSTGRES_PASSWORD: tickets
@@ -93,6 +120,15 @@ services:
 
   redis:
     image: redis:8-alpine
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
     # Persistence is configured rather than left to the image default, which
     # is RDB snapshots alone: with those, a crash loses every write since the
     # last snapshot, and the default schedule measures that in minutes. For a
@@ -132,6 +168,15 @@ services:
 
   rabbitmq:
     image: rabbitmq:4-management-alpine
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     environment:
       RABBITMQ_DEFAULT_USER: tickets
       RABBITMQ_DEFAULT_PASS: tickets
@@ -152,7 +197,63 @@ services:
       retries: 10
       start_period: 40s
 
+  # Observability. Both are provisioned entirely by file — no clicking, no
+  # dashboard saved in somebody's browser, and a screenshot in the README that
+  # anybody can reproduce with one command.
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # A campaign is over in seconds and these are local runs, so there is
+      # nothing to keep for a fortnight.
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    depends_on:
+      api:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    environment:
+      # Anonymous viewing, deliberately. This is a local stack whose only
+      # secret is a throwaway Postgres password, and a login prompt between a
+      # reader and the dashboard is friction with nothing behind it.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: light
+      # Opens straight on the dashboard rather than on an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ticket-office.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    depends_on:
+      - prometheus
+
 volumes:
   postgres-data:
   redis-data:
   rabbitmq-data:
+  prometheus-data:
+  grafana-data:
