@@ -268,7 +268,7 @@ func (s *Store) SettlePurchase(ctx context.Context, purchaseID string, status do
 
 	// Nothing was pending. Either this already ran, or the row is in a state
 	// no fulfilment should move it out of, and the two need different answers.
-	current, err := s.readPurchaseByID(ctx, purchaseID)
+	current, err := readPurchaseByID(ctx, s.pool, purchaseID)
 	switch {
 	case err != nil:
 		return domain.Purchase{}, err
@@ -310,7 +310,14 @@ func (s *Store) CancelPurchase(ctx context.Context, purchaseID string) (domain.P
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Either it is already cancelled — which is this function having
 		// already run, and not a failure — or there is no such purchase.
-		current, readErr := s.readPurchaseByID(ctx, purchaseID)
+		//
+		// Read on the transaction, not on the pool. Going back to the pool
+		// here asks for a second connection while this one is still held, and
+		// under enough concurrency every connection in the pool is a
+		// transaction waiting for a connection that will never be free. That
+		// is not a slow path, it is a deadlock, and it needs more simultaneous
+		// callers than a pool has connections to appear at all.
+		current, readErr := readPurchaseByID(ctx, tx, purchaseID)
 		if readErr != nil {
 			return domain.Purchase{}, readErr
 		}
@@ -333,8 +340,19 @@ func (s *Store) CancelPurchase(ctx context.Context, purchaseID string) (domain.P
 	return purchase, nil
 }
 
-func (s *Store) readPurchaseByID(ctx context.Context, purchaseID string) (domain.Purchase, error) {
-	purchase, err := scanPurchase(s.pool.QueryRow(ctx,
+// querier is anything that can run one query: the pool, or a transaction on a
+// connection borrowed from it.
+//
+// It exists so that a read inside an open transaction uses that transaction
+// rather than reaching back into the pool for a connection it cannot get. Both
+// satisfy it already; naming it is what makes the choice visible at the call
+// site instead of accidental.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func readPurchaseByID(ctx context.Context, q querier, purchaseID string) (domain.Purchase, error) {
+	purchase, err := scanPurchase(q.QueryRow(ctx,
 		`SELECT `+purchaseColumns+` FROM purchases WHERE id = $1`, purchaseID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Purchase{}, domain.ErrPurchaseNotFound
