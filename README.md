@@ -320,18 +320,62 @@ sequenceDiagram
 campaign, through the real HTTP API, on the same machine and the same command
 for both columns — `make reset` first, generator inside the Docker network:
 
-| | Phase 1 — SELECT then UPDATE | Phase 2 — one Lua script |
-|---|---|---|
-| Tickets sold | **500** | **100** |
-| Oversold | **400** | **0** |
-| Users holding more than one | 0 | 0 |
-| `available` in PostgreSQL afterwards | **−400** | 0 |
-| Refused `stock_exhausted` | 0 | 400 |
-| Requests that failed to get a response | 0 | 0 |
-| p95 latency | 2.65 s | **1.01 s** |
-| p90 latency | 2.64 s | 0.77 s |
-| Throughput | 176 req/s | **372 req/s** |
-| Wall clock for all 500 | 2.8 s | **1.3 s** |
+| | Phase 1 — SELECT then UPDATE | Phase 2 — one Lua script | Phase 3 — 202 and a worker |
+|---|---|---|---|
+| Tickets sold | **500** | **100** | **100** |
+| Oversold | **400** | **0** | **0** |
+| Users holding more than one | 0 | 0 | 0 |
+| `available` in PostgreSQL afterwards | **−400** | 0 | 0 |
+| Refused `stock_exhausted` | 0 | 400 | 400 |
+| Requests that failed to get a response | 0 | 0 | 0 |
+| p95 latency | 2.65 s | 1.01 s | **0.58 s** |
+| p90 latency | 2.64 s | 0.77 s | **0.48 s** |
+| Throughput | 176 req/s | 372 req/s | **564 req/s** |
+| Wall clock for all 500 | 2.8 s | 1.3 s | **0.9 s** |
+
+Phase 3 adds a synchronous `INSERT` and a confirmed publish to the request path
+and comes out *faster*, which deserves an explanation rather than a victory lap.
+Two things moved. The connection pool is now sized deliberately — sixteen
+connections with four kept warm, against a default that depends on the machine
+and dials on demand, so the hundred winners no longer queue behind a handshake
+apiece at exactly the wrong moment. And the response no longer waits on anything
+slow, because there is nothing slow left on that path: the two-second render
+moved to the worker, which is the entire point of the phase.
+
+What the table does *not* show is time to a finished ticket. That is now a
+separate question with a separate answer — a single worker at `FULFILMENT_DELAY=2s`
+takes about three and a half minutes to drain a hundred, and `--scale worker=3`
+divides it. Answering "how long until my PDF exists?" with a number from this
+table would be the kind of quiet dishonesty the 202 exists to avoid.
+
+The phase 3 run, unedited:
+
+```
+     ✓ no server error
+     ✓ answer is one of the documented outcomes
+     ✓ the request was well formed
+
+     checks_total.......: 1500    1691.563277/s
+     checks_succeeded...: 100.00% 1500 out of 1500
+     checks_failed......: 0.00%   0 out of 1500
+
+     ✓ http_req_failed ....... rate<0.01  rate=0.00%
+
+     rejected_stock_exhausted: 400
+     tickets_sold............: 100
+     http_req_duration.......: avg=259.31ms med=208.2ms p(90)=478.61ms p(95)=576.05ms
+     iterations..............: 500     563.854426/s
+```
+
+and the state it left behind, in both systems:
+
+```
+redis     stock=0  buyers=100
+postgres  100 live tickets, 0 users holding more than one, available=0
+          (11 confirmed, 89 pending at the moment of the check — all 100
+           confirmed once the worker caught up, with every queue empty and
+           nothing in the dead letter queue)
+```
 
 Phase 1 sold not 101, not 140, but every ticket asked for: every request read
 the same availability, concluded it had the last one, and got it. The
@@ -496,6 +540,25 @@ stock=60  buyers=40
 Sixty, not one hundred. And `student-1`, who bought before the wipe, is still
 refused with `already_purchased` afterwards — which is the half that has no
 symptom when it is missing.
+
+**Re-run in the hardest case phase 3 introduces.** The forty sales above were
+made with the worker *stopped*, so every one of them was still `pending` when
+Redis was wiped — not one had been confirmed:
+
+```
+--- postgres after 40 sales, worker stopped ---
+ pending | 40
+--- FLUSHALL, then restart the api ---
+stock=60  buyers=40
+```
+
+This is the measurement that decides the design. Had the worker been the one to
+write these rows, PostgreSQL would have held *nothing*, reconciliation would
+have computed a stock of one hundred and a buyer set of zero, and all forty
+seats would have gone on sale again to people who could not have them. Starting
+the worker afterwards confirmed all forty from messages that had outlived the
+Redis wipe and the API restart, because the queue is durable and its messages
+persistent.
 
 **Consequences.** Startup now depends on PostgreSQL being reachable, which is a
 real cost: the service cannot come up during a database outage. In exchange it
