@@ -18,15 +18,39 @@ import (
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
 )
 
+// Decider is the half of the system that decides, and Recorder is the half that
+// remembers. *cache.Cache and *store.Store satisfy them, and nothing else in
+// the production build does.
+//
+// They exist because the interesting behaviour in this package is what happens
+// when one of the two halves fails, and a test that cannot make Redis or
+// PostgreSQL fail on demand cannot reach any of it. The happy path is covered
+// against real containers, where it belongs; the compensation policy is covered
+// here, where a failure is one line of test code instead of a killed container
+// and a race to hit the right instant.
+type Decider interface {
+	Purchase(ctx context.Context, campaignID, userID string) (cache.Outcome, int64, error)
+	Release(ctx context.Context, campaignID, userID string) (bool, error)
+	Remaining(ctx context.Context, campaignID string) (int64, bool, error)
+	Reconcile(ctx context.Context, campaignID string, remaining int, buyers []string) error
+	WithLock(ctx context.Context, key string, ttl, wait time.Duration, fn func(context.Context) error) error
+}
+
+// Recorder is the source of truth.
+type Recorder interface {
+	RecordPurchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error)
+	ReadCampaignState(ctx context.Context, campaignID string) (store.CampaignState, error)
+}
+
 // Service sells tickets.
 type Service struct {
-	cache  *cache.Cache
-	store  *store.Store
+	cache  Decider
+	store  Recorder
 	logger *slog.Logger
 }
 
 // New builds a Service.
-func New(c *cache.Cache, s *store.Store, logger *slog.Logger) *Service {
+func New(c Decider, s Recorder, logger *slog.Logger) *Service {
 	return &Service{cache: c, store: s, logger: logger}
 }
 
