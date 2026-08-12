@@ -3,7 +3,7 @@
 -- The undo for a purchase that Redis granted and the rest of the system then
 -- failed to complete. It has to be idempotent, because everything that calls it
 -- is already on a path where something went wrong once and may well go wrong
--- twice: a retry, a reconciliation job and a compensation consumer can all
+-- twice: a retry, the reservation sweeper and the compensation consumer can all
 -- reach for the same ticket.
 --
 -- SREM reports whether it actually removed anything, and the INCR is
@@ -14,11 +14,19 @@
 -- reason it is not that bug here is that the test and the increment are one
 -- step.
 --
+-- The reservation goes too, unconditionally. It is removed even when there was
+-- no ticket to release, because a reservation without a holder is exactly the
+-- leftover this is here to clean up, and leaving it would mean the sweeper
+-- looked at the same abandoned entry on every pass forever.
+--
 -- KEYS[1]  stock counter
 -- KEYS[2]  set of user ids holding a ticket
+-- KEYS[3]  sorted set of reservations
 -- ARGV[1]  the buyer to release
 --
 -- Returns the new stock, or -1 if this person held no ticket.
+
+redis.call('ZREM', KEYS[3], ARGV[1])
 
 if redis.call('SREM', KEYS[2], ARGV[1]) == 0 then
     return -1

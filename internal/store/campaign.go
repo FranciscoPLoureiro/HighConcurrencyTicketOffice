@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
 	"github.com/google/uuid"
@@ -365,4 +366,67 @@ func readPurchaseByID(ctx context.Context, q querier, purchaseID string) (domain
 		return domain.Purchase{}, fmt.Errorf("read purchase: %w", err)
 	}
 	return purchase, nil
+}
+
+// HasLiveTicket reports whether this person holds a seat in the campaign.
+//
+// The question the sweeper asks before giving a ticket back, and the reason it
+// is safe to give one back at all. A reservation only says a ticket left the
+// shelf; whether the sale completed is a fact only this table holds.
+//
+// Live, not confirmed. A pending purchase is a completed sale whose paperwork
+// is still running, and treating it as absent would release a seat somebody is
+// about to receive a ticket for.
+func (s *Store) HasLiveTicket(ctx context.Context, campaignID, userID string) (bool, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM purchases
+			WHERE campaign_id = $1 AND user_id = $2 AND status <> $3
+		)`,
+		campaignID, userID, domain.StatusCancelled,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check for a live ticket: %w", err)
+	}
+	return exists, nil
+}
+
+// StalledPurchases lists purchases that have been pending too long.
+//
+// These are the sales whose row committed and whose message never reached the
+// broker — the second of the two crash windows. Nothing finds them by waiting,
+// because a purchase stuck forever looks exactly like one whose worker is busy;
+// the only difference is how long it has looked that way.
+//
+// Ordered oldest first, so a backlog is worked through in the order people have
+// been waiting, and limited so that one pass cannot pull an entire campaign
+// into memory.
+func (s *Store) StalledPurchases(ctx context.Context, campaignID string, olderThan time.Duration, limit int) ([]domain.Purchase, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+purchaseColumns+`
+		FROM purchases
+		WHERE campaign_id = $1
+		  AND status = $2
+		  AND updated_at < now() - $3::interval
+		ORDER BY updated_at
+		LIMIT $4`,
+		campaignID, domain.StatusPending, olderThan.String(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("read stalled purchases: %w", err)
+	}
+	defer rows.Close()
+
+	var stalled []domain.Purchase
+	for rows.Next() {
+		purchase, err := scanPurchase(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan stalled purchase: %w", err)
+		}
+		stalled = append(stalled, purchase)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read stalled purchases: %w", err)
+	}
+
+	return stalled, nil
 }

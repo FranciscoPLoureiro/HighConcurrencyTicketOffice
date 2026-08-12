@@ -32,7 +32,7 @@ const (
 // how much stock is left after it.
 func (c *Cache) Purchase(ctx context.Context, campaignID, userID string) (Outcome, int64, error) {
 	outcome, remaining, err := intPair(c.purchase.Run(ctx, c.client,
-		[]string{stockKey(campaignID), buyersKey(campaignID)},
+		[]string{stockKey(campaignID), buyersKey(campaignID), reservationsKey(campaignID)},
 		userID,
 	).Result())
 	if err != nil {
@@ -54,7 +54,7 @@ func (c *Cache) Purchase(ctx context.Context, campaignID, userID string) (Outcom
 // undid the purchase" from "there was nothing to undo".
 func (c *Cache) Release(ctx context.Context, campaignID, userID string) (bool, error) {
 	remaining, err := c.release.Run(ctx, c.client,
-		[]string{stockKey(campaignID), buyersKey(campaignID)},
+		[]string{stockKey(campaignID), buyersKey(campaignID), reservationsKey(campaignID)},
 		userID,
 	).Int64()
 	if err != nil {

@@ -17,8 +17,16 @@
 -- set is empty, and a purchase landing in that window is granted to someone who
 -- already holds a ticket.
 --
+-- The reservation set is cleared outright. After this script the whole of
+-- Redis has been recomputed from the source of truth, so every reservation in
+-- it is answered one way or the other already: a buyer with a live row is in
+-- the set below and needs no reservation held open, and one without has had
+-- their ticket returned by the arithmetic. Leaving the old entries would give
+-- the sweeper a list of ghosts to check against PostgreSQL on every pass.
+--
 -- KEYS[1]     stock counter
 -- KEYS[2]     set of user ids holding a ticket
+-- KEYS[3]     sorted set of reservations
 -- ARGV[1]     remaining stock
 -- ARGV[2..n]  the holders, if any
 --
@@ -26,6 +34,7 @@
 
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[3])
 
 -- SADD takes the members as arguments, and unpacking tens of thousands of them
 -- at once overflows the Lua stack. Chunked, this scales with the campaign

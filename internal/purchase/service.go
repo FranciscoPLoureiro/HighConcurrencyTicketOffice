@@ -37,6 +37,12 @@ type Decider interface {
 	Remaining(ctx context.Context, campaignID string) (int64, bool, error)
 	Reconcile(ctx context.Context, campaignID string, remaining int, buyers []string) error
 	WithLock(ctx context.Context, key string, ttl, wait time.Duration, fn func(context.Context) error) error
+
+	// The reservation half, added in phase 5 so that a sale interrupted
+	// partway through is visible to something other than a restart.
+	Confirm(ctx context.Context, campaignID, userID string) (bool, error)
+	ExpiredReservations(ctx context.Context, campaignID string, olderThan time.Duration, limit int64) ([]cache.Reservation, error)
+	CountReservations(ctx context.Context, campaignID string) (int64, error)
 }
 
 // Recorder is the source of truth.
@@ -45,6 +51,11 @@ type Recorder interface {
 	CancelPurchase(ctx context.Context, purchaseID string) (domain.Purchase, error)
 	ReadPurchase(ctx context.Context, campaignID, purchaseID string) (domain.Purchase, error)
 	ReadCampaignState(ctx context.Context, campaignID string) (store.CampaignState, error)
+
+	// What the sweeper asks before it gives a ticket back, and what it reads
+	// to find sales nothing is fulfilling.
+	HasLiveTicket(ctx context.Context, campaignID, userID string) (bool, error)
+	StalledPurchases(ctx context.Context, campaignID string, olderThan time.Duration, limit int) ([]domain.Purchase, error)
 }
 
 // Fulfiller takes a sold ticket away to be finished elsewhere.
@@ -112,8 +123,30 @@ type Service struct {
 	store     Recorder
 	fulfiller Fulfiller
 	timeouts  Timeouts
+	sweep     SweepPolicy
 	observer  Observer
+	faults    Faults
 	logger    *slog.Logger
+}
+
+// WithSweepPolicy sets how long a thing has to be stuck before the sweeper acts.
+func (s *Service) WithSweepPolicy(p SweepPolicy) *Service {
+	if p.ReservationAge > 0 {
+		s.sweep.ReservationAge = p.ReservationAge
+	}
+	if p.PendingAge > 0 {
+		s.sweep.PendingAge = p.PendingAge
+	}
+	if p.Batch > 0 {
+		s.sweep.Batch = p.Batch
+	}
+	return s
+}
+
+// WithFaults arms deliberate failures. See faults.go.
+func (s *Service) WithFaults(f Faults) *Service {
+	s.faults = f
+	return s
 }
 
 // WithObserver attaches metrics to a Service.
@@ -139,7 +172,14 @@ func New(c Decider, s Recorder, f Fulfiller, timeouts Timeouts, logger *slog.Log
 		timeouts.Publish = DefaultTimeouts.Publish
 	}
 
-	return &Service{cache: c, store: s, fulfiller: f, timeouts: timeouts, logger: logger}
+	return &Service{
+		cache:     c,
+		store:     s,
+		fulfiller: f,
+		timeouts:  timeouts,
+		sweep:     DefaultSweepPolicy,
+		logger:    logger,
+	}
 }
 
 // compensationBudget bounds the attempt to put a ticket back after the write to
@@ -192,6 +232,13 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID, idempotencyK
 	case cache.Sold:
 	}
 
+	// The ticket has left the shelf and nothing durable knows it yet. This is
+	// the window phase 5 exists for, and the fault injector opens it on
+	// purpose so that a test can prove the sweeper closes it.
+	if err := s.faults.after(FaultAfterDecrement); err != nil {
+		return domain.Purchase{}, err
+	}
+
 	purchase, err := withBudget2(ctx, s.timeouts.Postgres,
 		func(ctx context.Context) (domain.Purchase, error) {
 			return s.store.RecordPending(ctx, campaignID, userID, idempotencyKey)
@@ -221,9 +268,27 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID, idempotencyK
 		return domain.Purchase{}, fmt.Errorf("record purchase: %w", err)
 	}
 
+	// The row exists and the message is not sent. The second crash window,
+	// and the one the sweeper republishes out of.
+	if err := s.faults.after(FaultAfterRecord); err != nil {
+		return domain.Purchase{}, err
+	}
+
 	if err := s.handOver(ctx, purchase); err != nil {
 		s.rejected(reasonPublishFailed)
 		return domain.Purchase{}, err
+	}
+
+	// The sale is accounted for everywhere that matters, so the reservation
+	// has nothing left to protect. Failing to close it is not worth failing
+	// the request over: the sweeper will find it open, ask PostgreSQL, see a
+	// real purchase and close it then. One wasted read against a purchase the
+	// caller has already been promised.
+	if _, err := s.cache.Confirm(ctx, campaignID, userID); err != nil {
+		s.logger.Warn("sold a ticket but could not close its reservation",
+			slog.String("campaign_id", campaignID),
+			slog.String("user_id", userID),
+			slog.Any("error", err))
 	}
 
 	if s.observer != nil {

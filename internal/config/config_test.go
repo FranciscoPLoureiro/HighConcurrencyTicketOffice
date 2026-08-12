@@ -54,6 +54,9 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("PUBLISH_TIMEOUT", "4s")
 	t.Setenv("METRICS_ADDR", ":9999")
 	t.Setenv("QUEUE_DEPTH_INTERVAL", "7s")
+	t.Setenv("SWEEP_INTERVAL", "9s")
+	t.Setenv("RESERVATION_AGE", "90s")
+	t.Setenv("PENDING_AGE", "3m")
 
 	cfg, err := Load()
 	if err != nil {
@@ -88,6 +91,10 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 		RedisTimeout:    time.Second,
 		PostgresTimeout: 3 * time.Second,
 		PublishTimeout:  4 * time.Second,
+
+		SweepInterval:  9 * time.Second,
+		ReservationAge: 90 * time.Second,
+		PendingAge:     3 * time.Minute,
 
 		MetricsAddr:        ":9999",
 		QueueDepthInterval: 7 * time.Second,
@@ -210,6 +217,29 @@ func TestNegativeRateLimitsAreRejectedButZeroIsNot(t *testing.T) {
 	}
 }
 
+// The one configuration mistake in this project that can oversell a campaign.
+//
+// A reservation is released on the strength of PostgreSQL not knowing about the
+// sale. If it can be released while the request that made it is still running,
+// the sweeper hands back a seat somebody is in the middle of buying — so this
+// must be longer than the request budget, and the service refuses to start
+// rather than run with a value that permits it.
+func TestAReservationShorterThanTheRequestBudgetIsRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("REQUEST_TIMEOUT", "30s")
+	t.Setenv("RESERVATION_AGE", "10s")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted a reservation age below the request timeout")
+	}
+	for _, want := range []string{"RESERVATION_AGE", "REQUEST_TIMEOUT"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s; an operator needs both numbers", err, want)
+		}
+	}
+}
+
 func TestNonPositiveShutdownTimeoutIsRejected(t *testing.T) {
 	clearEnv(t)
 	// Zero would make graceful shutdown a no-op, quietly turning every
@@ -250,6 +280,10 @@ func clearEnv(t *testing.T) {
 		"PUBLISH_TIMEOUT",
 		"METRICS_ADDR",
 		"QUEUE_DEPTH_INTERVAL",
+		"SWEEP_INTERVAL",
+		"RESERVATION_AGE",
+		"PENDING_AGE",
+		"FAULT_INJECTION",
 	} {
 		t.Setenv(key, "")
 	}
