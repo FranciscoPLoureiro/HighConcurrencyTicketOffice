@@ -40,16 +40,23 @@ type Faults struct {
 	// Armed is the point to fail at, or empty.
 	Armed Fault
 
-	// Kill, when set, is called instead of returning an error — and is where
-	// os.Exit lives in the compose demonstration.
+	// Kill, when set, ends the process instead of returning an error.
 	//
-	// Two modes because the brief asks for a killed *process* and a test
-	// cannot assert anything about a process that has called os.Exit. What
-	// both modes share is the only property that matters: the sale stops
-	// exactly there, having compensated nothing, which is precisely the state
-	// a crash leaves behind. Returning an error simulates the crash rather
-	// than performing one, and the sweeper cannot tell the difference because
-	// there is no difference in what it can see.
+	// The two modes demonstrate different halves of the recovery, which is
+	// why both exist rather than one being a convenience for tests.
+	//
+	// Returning an error abandons the sale and leaves the process alive. That
+	// is what a panic recovered mid-request looks like, or a crash of one
+	// instance among several, and it is the case the *sweeper* handles: the
+	// reservation is open, nobody is coming back for it, and something still
+	// running notices.
+	//
+	// Killing the process is the harder failure the brief asks for, and it
+	// takes the sweeper down with it — the sweeper runs inside the API. With
+	// a single instance nothing sweeps until the process returns, and what
+	// recovers the ticket then is startup reconciliation, which rebuilds
+	// Redis from PostgreSQL before serving anything. Two mechanisms, two
+	// failures, and the README demonstrates both.
 	Kill func()
 }
 

@@ -9,11 +9,12 @@ and without letting one person take two — both of which it now does — and,
 eventually, without losing a ticket when a process dies halfway through a
 purchase.
 
-That last one is the interesting problem, and it is the one still open. The
-stock lives in Redis and the fulfilment work lives in RabbitMQ: separate systems
-that fail independently, so "decrement the stock, then publish the job" has a
-gap in the middle where a ticket can vanish. Phase 5 is about that gap. The
-table below says what has actually landed.
+That last one is the interesting problem, and it is now closed. The stock lives
+in Redis and the fulfilment work lives in RabbitMQ: separate systems that fail
+independently, so "decrement the stock, then publish the job" has a gap in the
+middle where a ticket can vanish. A reservation makes the gap visible and a
+sweeper closes it, which the test suite proves by killing sales mid-flight and
+watching the tickets come back.
 
 ## Status
 
@@ -27,10 +28,10 @@ request.
 | 2 | Atomic purchase in Redis, stock reconciliation | ✅ done |
 | 3 | Async fulfilment with RabbitMQ, idempotency | ✅ done |
 | 4 | Prometheus, Grafana, calibrated load testing | ✅ done |
-| 5 | The lost ticket, compensation saga, failure modes | ⬜ |
+| 5 | The lost ticket, compensation saga, failure modes | ✅ done |
 
-The architecture diagram draws the unbuilt parts with dashed lines, so the shape
-of the finished system is visible without any of it being claimed as done.
+Every phase is merged. The remaining work is in the roadmap at the bottom, and
+the known limitations section is honest about what this still does not do.
 
 ## Quick start
 
@@ -416,6 +417,14 @@ Client ──Idempotency-Key──> [Rate limiter] ──429 + Retry-After──
   API returns 202 + correlation id; the client polls /status.
 
   [Prometheus] <-- scrapes the API and every worker; [Grafana] draws it
+
+  [Sweeper]  in the API, every 15s, under the reconciliation lock
+      |  reservation open and no row  --> give the ticket back
+      +--reservation open and a row --> close it
+      |  row pending and no message  --> publish it again
+      v
+  [Saga]  in the worker, draining the dead letter queue
+      cancel the row, INCR the stock, drop the holder, notify
 ```
 
 A sale makes three writes across three systems, and no two of them are atomic
@@ -1124,6 +1133,205 @@ integration job rather than in `verify`. There is still no badge, and there will
 not be one until it is worth trusting: 61% is a description of what is covered,
 not a target to raise.
 
+### The lost ticket, and the three ways out of it
+
+**Context.** The most interesting failure in the system, and the one the whole
+project has been narrowing since phase 2. A sale is three writes to three
+systems that fail independently:
+
+```
+1. The Lua script decrements the stock in Redis.   ✓ committed
+2. The API records the purchase in PostgreSQL.     ✗ the process dies here
+3. The API publishes to RabbitMQ.
+```
+
+The ticket has left the shelf, no record of it exists, and the client never got
+an answer. Nothing in the system is looking for it. With a hundred tickets, a
+handful of well-placed crashes closes the campaign having sold nothing.
+
+**Options.**
+
+*A — reservation with a TTL.* The script records that a ticket left the shelf,
+and a job returns any reservation nobody came back for. Cheap, and needs care:
+returning a ticket whose sale actually completed sells one seat twice.
+
+*B — transactional outbox.* The intent to buy is written to PostgreSQL in the
+same transaction as the purchase, and a separate process reads that table and
+publishes. Removes the dual write outright — there is only one write, and either
+both rows commit or neither does. The cost is a synchronous database write on
+the critical path *before* the sale is decided, which is much of what phase 2
+spent Redis to avoid.
+
+*C — Redis Streams as the queue.* The decrement and the enqueue happen in the
+same Lua script, so they are atomic by construction. Eliminates the problem
+rather than recovering from it, and gives up RabbitMQ — the dead letter queue,
+the routing, the management UI, the operational familiarity — to do it.
+
+**Decision.** A, with the care spelled out.
+
+B is the better answer to a different question. It removes a failure this system
+can already detect, at the cost of putting the database back on the path phase 2
+worked to keep it off, and the outbox poller has to be built and run either way.
+C is genuinely elegant and the trade is too large: it would mean this project no
+longer demonstrates a message broker, which is a stated goal, and Redis Streams
+would then be holding both the invariant and the work queue with no second
+system to reconcile against.
+
+**Consequences, and where the care goes.**
+
+The reservation is a sorted set scored by time, not a key per reservation with a
+TTL. The second is the design Redis looks purpose-built for and it does not
+work: keyspace notifications are fire and forget, published to whoever is
+subscribed at that instant and recorded nowhere. A subscriber that is
+restarting, briefly disconnected or merely slow never learns the key expired,
+and neither does anyone else, ever — and the event that goes missing is the one
+saying "this ticket was never sold, put it back". The failure mode of the
+mechanism is exactly the failure it was chosen to fix, made permanent and
+silent. Polling a sorted set is less elegant and cannot lose anything.
+
+**Redis scores the reservation from its own clock**, not the caller's. The
+comparison against the cutoff is what decides whether a ticket is taken back,
+and timestamps from several API instances would be several clocks: a machine
+running a few seconds fast would have its reservations swept early, releasing a
+seat whose sale is still in flight.
+
+**The database is asked before anything is released, every time.** A reservation
+only says a ticket *left* the shelf; whether the sale completed is a fact only
+the source of truth holds. And an unanswered query is not a no — a failed lookup
+leaves the reservation exactly where it is, because "PostgreSQL has never heard
+of this sale" and "PostgreSQL did not reply" are indistinguishable if the error
+is ignored, and acting on the second hands back seats people are holding.
+
+`RESERVATION_AGE` is the one setting in this project that can cause an oversell,
+so the service **refuses to start** unless it is comfortably longer than
+`REQUEST_TIMEOUT`. A reservation released while its request is still running
+sells one seat twice.
+
+There is a second window — the row committed and the publish did not — and it is
+swept differently. That purchase is a real sale whose seat is genuinely taken;
+what it is missing is a message. So it is **republished, not released**, which
+is safe because settling is already idempotent.
+
+**Proven with fault injection, against the running stack.** `FAULT_INJECTION`
+arms either window, and `FAULT_KILL` decides whether the sale is merely
+abandoned or the process actually dies. The two are separated because they
+demonstrate *different* recovery paths, which is the thing running this
+exercise made obvious:
+
+```bash
+make up
+FAULT_INJECTION=after-decrement RESERVATION_AGE=15s SWEEP_INTERVAL=5s   docker compose up -d --wait api
+
+# three sales that die between the decrement and the record
+purchase 1 -> http 500
+purchase 2 -> http 500
+purchase 3 -> http 500
+
+stock: 97   reservations: 3   rows in postgres: 0
+```
+
+Fifteen seconds later, without anything being restarted:
+
+```json
+{"msg":"returned a ticket whose sale never completed","user_id":"doomed-2","open_for":17817575162}
+{"msg":"sweeper recovered tickets that were stuck","examined":3,"released":3,"closed":0,"republished":0}
+```
+
+```
+stock: 100   reservations: 0
+```
+
+**Now the same fault with `FAULT_KILL=true`, which is the harder one the brief
+asks for — and it recovers by a different route.** The process really exits, and
+it takes the sweeper with it, because the sweeper runs inside the API. With a
+single instance nothing sweeps at all until it comes back:
+
+```
+{"level":"ERROR","msg":"fault injection: killing the process mid-sale","point":"after-decrement"}
+api  Exited (1)
+stock: 99   reservations: 1
+```
+
+The ticket stays stranded for as long as the API is down. What recovers it is
+startup reconciliation, which rebuilds Redis from PostgreSQL before serving
+anything:
+
+```json
+{"msg":"reconciled redis from postgres","remaining":100,"holders":0,
+ "redis_had_state":true,"previous_remaining":99}
+```
+
+Two mechanisms for two failures, and worth being explicit about which covers
+what: the sweeper handles a sale that died while the process lived — a recovered
+panic, a lost reply, one instance crashing among several — and reconciliation
+handles the process itself dying. Running more than one API instance collapses
+the difference, since the survivors keep sweeping.
+
+### Why the dead letter queue has a consumer
+
+**Context.** A ticket whose fulfilment failed every attempt sat in the dead
+letter queue holding its seat. The row said the seat was taken, so
+reconciliation kept it taken, and nothing was going to change that: the person
+who bought it could not buy again and nobody else could have it.
+
+**Decision.** A compensation saga drains it — which is normally a bad idea, and
+worth defending.
+
+Draining a dead letter queue automatically is how a poisonous message gets
+retried forever. It is safe here only because this **does not retry anything**.
+The message is already known not to work; the ticket attached to it is what is
+worth rescuing.
+
+**Consequences.** Three writes in a deliberate order: PostgreSQL, then Redis,
+then the notification. The same order the purchase path reverses in, and for the
+same reason — if the second step fails, Redis is one ticket short of the truth
+and reconciliation fixes it, where the other order leaves the ticket back on the
+shelf while a live row still says whose it is.
+
+Releasing is **not conditional** on the cancellation having changed anything. An
+earlier attempt may have cancelled the row and then died before returning the
+ticket, and skipping the release because the row was "already done" would strand
+that ticket permanently — the one state nothing else revisits.
+
+The notification is last and its failure is not the saga's failure. The ticket
+is back and the row is cancelled; returning an error for a lost log line would
+have the message redelivered and the whole thing run again.
+
+Consumers take a settlement policy, because this queue needs the opposite of the
+processing queue's. Sending a failure through the retry tiers would dead-letter
+it back onto the *processing* queue and hand a message known not to work to the
+workers all over again.
+
+And the whole thing is idempotent, because the brief says an interviewer will
+look for exactly this: **twenty simultaneous compensations of the same sale
+return one ticket, not twenty.** A campaign of ten does not quietly become a
+campaign of eleven.
+
+### What happens when Redis disappears
+
+**Context.** Redis is the only place the stock invariant is enforced. If it goes
+away mid-campaign, the API can refuse everybody or sell on the assumption that
+stock probably remains.
+
+**Decision.** Fail closed, and it always has — this phase added the test that
+proves it by taking the container away rather than asserting it.
+
+For a campaign oversubscribed fifty to one, "probably" is a hundred angry people
+and a refund process. Refusing everybody is a bad afternoon that ends when Redis
+comes back.
+
+**Consequences.** The refusal must not masquerade as a decision. `stock_exhausted`,
+`already_purchased` and `campaign_not_found` all tell a caller that the system
+considered their request and said no; an outage considered nothing, and dressing
+it up as one of those is a lie a client acts on. It is a `500`, and the test
+asserts it is none of the other three.
+
+Note what this is *not*. The rate limiter fails **open** on the same outage,
+because it protects the system from load rather than enforcing an invariant, and
+turning a Redis blip into a blanket `429` invents a second outage on top of the
+first. Two components, one dependency, opposite failure directions — decided by
+what each is actually for.
+
 ### Why the standard library instead of a web framework
 
 **Context.** The API has a handful of routes and needs middleware for identity,
@@ -1149,14 +1357,13 @@ Kept honest as the project grows.
   deliberate simplification of the brief, not an oversight — the interesting
   problem here is contention, not identity.
 - Payment is out of scope. A purchase reserves a ticket; no money moves.
-- **A process that dies between the two writes loses a ticket.** Redis grants
-  it and PostgreSQL records it, and those are separate systems: if the write to
-  PostgreSQL *fails*, the ticket is handed straight back, but if the process
-  dies in between, the ticket is decremented from a stock it never leaves. It
-  belongs to nobody until the next reconciliation. This is the central problem
-  of the whole design and phase 5.1 is where it is solved properly, with a
-  reservation that expires. Today the window is microseconds wide and the
-  failure direction is safe — the campaign undersells rather than oversells.
+- **A ticket stranded by a crash is recovered within a sweep, not instantly.**
+  The reservation makes it visible and the sweeper returns it, but only once it
+  has been open longer than `RESERVATION_AGE` — a minute by default, because
+  releasing one whose sale is still in flight would sell the seat twice. So the
+  worst case is a ticket off the shelf for about seventy-five seconds. During a
+  campaign decided in the first few seconds, that is a ticket which effectively
+  did not sell, and the honest fix is not a shorter timer but fewer crashes.
 - **A write whose outcome is unknown is never undone, and that costs a ticket.**
   A `COMMIT` that times out, or a publish the broker never confirmed, may have
   succeeded. Compensating there would return stock the system has already given
@@ -1180,17 +1387,15 @@ Kept honest as the project grows.
   `(campaign_id, idempotency_key)` still catches the replay and answers
   `idempotency_key_replayed` — which is honest but less useful than the original
   `202`, because the response it refers to no longer exists anywhere.
-- **An unconfirmed publish leaves a purchase pending forever.** If the broker
-  never answers, the sale is deliberately *not* undone: it may have taken the
-  message and been slow to say so, and cancelling would undo a purchase a worker
-  is about to fulfil. Today nothing sweeps those rows up, so the ticket stays
-  out of circulation until somebody looks. Phase 5.1's reconciliation job is
-  what resolves them.
-- **The dead letter queue has no consumer.** Messages that fail every attempt
-  stop there, and the purchase stays `failed` — holding its seat, because
-  nothing has decided to give it back. That is deliberate: returning it
-  automatically would seat a second person while the first still holds a row
-  saying it is theirs. Phase 5.3 is the compensation saga that drains it.
+- **An unconfirmed publish leaves the purchase pending until the sweeper
+  republishes it.** If the broker never answers, the sale is deliberately not
+  undone — it may have taken the message and been slow to say so. The sweeper
+  republishes after `PENDING_AGE`, and the worker's idempotency absorbs the
+  duplicate if the original message did arrive.
+- **The compensation queue has no consumer.** The saga publishes to it and
+  nothing reads it. That is the boundary of this project rather than an
+  oversight: what belongs there is a notification service telling somebody their
+  ticket failed, and inventing one would be scope with no design behind it.
 - **The API does not reconnect to RabbitMQ.** The worker does, and loops until
   it succeeds; the API dials once at startup and, if the connection drops,
   publishes fail and purchases are reversed until it is restarted. The worker is
@@ -1220,6 +1425,24 @@ Kept honest as the project grows.
   uncovered; the domain logic and every failure path that can be provoked are
   not. There is no badge, and there will not be one until it says something
   worth trusting.
+- **The sweeper is the one component that can cause an oversell.** Everything
+  else here errs towards keeping a ticket off the shelf; this is the only thing
+  whose job is to put one back. It is guarded by asking the source of truth
+  before every release, by treating an unanswered query as "do not touch", and
+  by a startup check that refuses a `RESERVATION_AGE` shorter than the request
+  budget — but it is the piece to read first if a ticket is ever sold twice.
+- **Fault injection is a test tool that ships in the binary.** `FAULT_INJECTION`
+  is empty everywhere except a deliberate demonstration, and an unrecognised
+  value refuses to start rather than disarming quietly. It is still a switch
+  that makes production lose sales, and a system with real users would put it
+  behind a build tag.
+- **No circuit breaker.** The brief lists one as a bonus: if PostgreSQL is
+  unavailable, the API should answer `503` immediately rather than accumulating
+  timeouts. Today every call has its own budget, so a database outage produces
+  slow failures rather than hung ones — bounded, but not fast. It is in the
+  roadmap rather than done, and the honest reason is that the timeouts already
+  bound the damage and a breaker would be the next improvement rather than a
+  missing guarantee.
 - **The dashboard has no alerting.** It shows the panels an incident would be
   read from, and nothing pages anybody. That is a deliberate stopping point for
   a project with no on-call rota, not an oversight.
@@ -1262,9 +1485,20 @@ shared-cpu-1x instance is not expected to reproduce any of them.
 
 ## Roadmap
 
-Beyond the phases above: real authentication, infrastructure as code rather than
-a Makefile, and multi-region — none of which change the concurrency problem this
-project exists to solve.
+What would come next, in the order it would earn its place:
+
+- **A circuit breaker on PostgreSQL.** The brief's bonus, and the one genuinely
+  missing piece of resilience: today a database outage produces slow failures
+  rather than immediate ones.
+- **A consumer for the compensation queue** — a notification service telling
+  people their ticket failed, which is the only thing currently published into
+  the void.
+- **Real authentication.** `X-User-ID` stands in for a validated JWT, which is a
+  documented simplification and would be the first thing to fix for real users.
+- **Infrastructure as code** rather than a Makefile and a hand-run `fly deploy`.
+- **Multi-region**, which changes everything above and none of the concurrency
+  problem this project exists to solve — the stock invariant is a single-writer
+  problem wherever it runs.
 
 ## Licence
 

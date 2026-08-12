@@ -284,6 +284,7 @@ func clearEnv(t *testing.T) {
 		"RESERVATION_AGE",
 		"PENDING_AGE",
 		"FAULT_INJECTION",
+		"FAULT_KILL",
 	} {
 		t.Setenv(key, "")
 	}

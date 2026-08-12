@@ -142,6 +142,25 @@ func withRequestTimeout(budget time.Duration, next http.Handler) http.Handler {
 	})
 }
 
+// killer returns the process-ending half of fault injection, or nil.
+//
+// nil is the default and the more useful demonstration: the sale is abandoned
+// and the process lives, which is what a recovered panic looks like — and it
+// leaves the sweeper running to be watched noticing. FAULT_KILL=true is the
+// harder failure the brief asks for, and it takes the sweeper down with it,
+// since the sweeper runs inside this process. What recovers the ticket then is
+// startup reconciliation.
+func killer(enabled bool, fault purchase.Fault, logger *slog.Logger) func() {
+	if !enabled {
+		return nil
+	}
+	return func() {
+		logger.Error("fault injection: killing the process mid-sale",
+			slog.String("point", string(fault)))
+		os.Exit(1)
+	}
+}
+
 // probeSelf performs the container healthcheck and returns a process exit code.
 func probeSelf() int {
 	cfg, err := config.Load()
@@ -295,16 +314,7 @@ func run() error {
 		}).
 		WithFaults(purchase.Faults{
 			Armed: fault,
-			// A real process death, because the brief asks for one and
-			// because a demonstration that politely returns an error is not
-			// the thing being demonstrated. The integration test arms the
-			// same point without a Kill, which stops the sale in exactly the
-			// same state and leaves a process alive to assert with.
-			Kill: func() {
-				logger.Error("fault injection: killing the process mid-sale",
-					slog.String("point", string(fault)))
-				os.Exit(1)
-			},
+			Kill:  killer(cfg.FaultKill, fault, logger),
 		})
 
 	if err := prepare(ctx, cfg, db, sales, logger); err != nil {

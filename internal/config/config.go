@@ -94,7 +94,13 @@ type Config struct {
 	// FaultInjection deliberately abandons a sale at a named point, so that
 	// the recovery can be watched working. Empty in every environment that is
 	// not a demonstration.
+	//
+	// FaultKill decides how: false abandons the sale and leaves the process
+	// running, which is what the sweeper recovers from; true ends the process,
+	// which takes the sweeper with it and leaves the recovery to startup
+	// reconciliation. They demonstrate different halves.
 	FaultInjection string
+	FaultKill      bool
 
 	// MetricsAddr is where the worker serves /metrics. The API serves its
 	// own on HTTPAddr alongside the routes, because it already has a
@@ -253,6 +259,7 @@ func Load() (Config, error) {
 		ReservationAge: durationVar("RESERVATION_AGE", defaultReservationAge, &errs),
 		PendingAge:     durationVar("PENDING_AGE", defaultPendingAge, &errs),
 		FaultInjection: stringVar("FAULT_INJECTION", ""),
+		FaultKill:      boolVar("FAULT_KILL", false, &errs),
 
 		MetricsAddr:        stringVar("METRICS_ADDR", defaultMetricsAddr),
 		QueueDepthInterval: durationVar("QUEUE_DEPTH_INTERVAL", defaultQueueDepthInterval, &errs),
@@ -409,6 +416,20 @@ func levelVar(key string, fallback slog.Level, errs *[]error) slog.Level {
 		return fallback
 	}
 	return level
+}
+
+func boolVar(key string, fallback bool, errs *[]error) bool {
+	raw := stringVar(key, "")
+	if raw == "" {
+		return fallback
+	}
+
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s: %q is not a boolean (want true or false): %w", key, raw, err))
+		return fallback
+	}
+	return v
 }
 
 func intVar(key string, fallback int, errs *[]error) int {
