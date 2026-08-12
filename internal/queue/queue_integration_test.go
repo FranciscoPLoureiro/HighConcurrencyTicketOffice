@@ -89,7 +89,7 @@ func consumeInto(t *testing.T, conn *Connection, publisher *Publisher, fn Handle
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	consumer := NewConsumer(conn, publisher, 1, slog.New(slog.DiscardHandler))
+	consumer := NewConsumer(conn, publisher, 1, 30*time.Second, slog.New(slog.DiscardHandler))
 
 	var wg sync.WaitGroup
 	wg.Add(1)

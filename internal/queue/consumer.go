@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -14,14 +15,26 @@ import (
 // Returning nil means the work is finished and the message may be
 // acknowledged. Returning an error means it should be tried again later, up to
 // MaxAttempts, after which the message is parked in the dead letter queue.
+//
+// Returning an error wrapping ErrPermanent skips the retries entirely.
 type Handler func(ctx context.Context, delivery Delivery) error
+
+// ErrPermanent marks a failure that will not come right on its own.
+//
+// A message referring to a purchase that does not exist, or one that has
+// already been cancelled, fails identically on every attempt — so retrying it
+// is a delay with no chance of success, and the two waits it spends doing so
+// are two waits nobody gets to see the real problem in. It goes straight to the
+// dead letter queue.
+var ErrPermanent = errors.New("failure will not resolve by retrying")
 
 // Consumer feeds a handler from the processing queue.
 type Consumer struct {
-	conn      *Connection
-	publisher *Publisher
-	logger    *slog.Logger
-	prefetch  int
+	conn        *Connection
+	publisher   *Publisher
+	logger      *slog.Logger
+	prefetch    int
+	workTimeout time.Duration
 }
 
 // NewConsumer builds a consumer.
@@ -34,11 +47,24 @@ type Consumer struct {
 // behind. Small numbers spread work across workers; larger ones cut the round
 // trips. Fulfilment here takes seconds, so the round trip is noise and the
 // spreading is the whole benefit.
-func NewConsumer(conn *Connection, publisher *Publisher, prefetch int, logger *slog.Logger) *Consumer {
+//
+// The work timeout bounds one handler run. It is the only thing standing
+// between a dependency that stops answering and a worker whose every prefetched
+// slot is occupied forever by a message nobody is making progress on.
+func NewConsumer(conn *Connection, publisher *Publisher, prefetch int, workTimeout time.Duration, logger *slog.Logger) *Consumer {
 	if prefetch <= 0 {
 		prefetch = 1
 	}
-	return &Consumer{conn: conn, publisher: publisher, logger: logger, prefetch: prefetch}
+	if workTimeout <= 0 {
+		workTimeout = time.Minute
+	}
+	return &Consumer{
+		conn:        conn,
+		publisher:   publisher,
+		logger:      logger,
+		prefetch:    prefetch,
+		workTimeout: workTimeout,
+	}
 }
 
 // Consume runs the handler over the processing queue until ctx ends or the
@@ -75,14 +101,14 @@ func (c *Consumer) Consume(ctx context.Context, handler Handler) error {
 	for {
 		select {
 		case <-ctx.Done():
-			// Graceful shutdown. Cancelling the consumer tells the broker to
-			// stop sending, and the deferred channel close redelivers
-			// anything already in flight to another worker rather than
-			// holding it until this connection times out.
+			// Graceful shutdown. Closing the channel — deferred above —
+			// tells the broker to stop sending and redelivers anything it
+			// had already pushed to another worker, rather than holding it
+			// until this connection times out.
 			//
-			// The message being worked on right now is not abandoned: the
-			// caller's handler is still running on a context this does not
-			// cancel, and the loop is only reached again once it returns.
+			// Nothing is interrupted mid-flight: dispatch runs inline, so
+			// reaching this case at all means no message is being worked on.
+			// The one that was is finished, settled and acknowledged.
 			return nil
 
 		case err := <-closed:
@@ -118,8 +144,20 @@ func (c *Consumer) dispatch(ctx context.Context, handler Handler, raw amqp.Deliv
 		slog.String("correlation_id", delivery.Message.CorrelationID),
 		slog.Int("attempt", delivery.Attempt))
 
-	if err := handler(ctx, delivery); err != nil {
-		c.retry(ctx, log, delivery, err)
+	// The handler's context is deliberately detached from the one that
+	// signals shutdown, and bounded by its own budget instead.
+	//
+	// The brief asks that a worker finish the message it is holding before it
+	// closes, and inheriting the cancellation would do the opposite: SIGTERM
+	// would abort the fulfilment halfway, and every deploy would leave a
+	// scattering of tickets to be retried. Stopping means taking no more
+	// work, not dropping the work in hand. What bounds the wait is the
+	// process's own shutdown timeout, which is a decision for the caller.
+	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.workTimeout)
+	defer cancel()
+
+	if err := handler(workCtx, delivery); err != nil {
+		c.settleFailure(ctx, log, delivery, err)
 		return
 	}
 
@@ -138,15 +176,17 @@ func (c *Consumer) dispatch(ctx context.Context, handler Handler, raw amqp.Deliv
 	}
 }
 
-// retry sends a failed message to its next attempt, or gives up on it.
-func (c *Consumer) retry(ctx context.Context, log *slog.Logger, delivery Delivery, cause error) {
+// settleFailure sends a failed message to its next attempt, or gives up on it.
+func (c *Consumer) settleFailure(ctx context.Context, log *slog.Logger, delivery Delivery, cause error) {
 	// A detached context, because the usual reason to be here during a
 	// shutdown is that the handler was cut short by it — and re-queueing the
 	// message is exactly what must still happen in that case.
 	ctx = context.WithoutCancel(ctx)
 
-	if delivery.Attempt >= MaxAttempts {
-		log.Error("message failed every attempt and is going to the dead letter queue",
+	permanent := errors.Is(cause, ErrPermanent)
+	if permanent || delivery.Attempt >= MaxAttempts {
+		log.Error("message is going to the dead letter queue",
+			slog.Bool("permanent", permanent),
 			slog.Any("error", cause))
 
 		if err := c.publisher.DeadLetter(ctx, delivery.Message, delivery.Attempt); err != nil {
