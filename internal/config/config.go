@@ -213,8 +213,9 @@ const (
 	// The safety-critical one. A reservation is released on the strength of
 	// PostgreSQL not knowing about it, so this has to exceed the longest a
 	// legitimate request can take by a comfortable margin: releasing one
-	// whose sale is still in flight sells the same seat twice. REQUEST_TIMEOUT
-	// bounds a purchase at ten seconds, so a minute is six times over.
+	// whose sale is still in flight sells the same seat twice. The floor
+	// validate() enforces is REQUEST_TIMEOUT + POSTGRES_TIMEOUT, fifteen
+	// seconds with these defaults, and a minute is four times that.
 	defaultReservationAge = time.Minute
 	// Longer than fulfilment takes, or the sweeper starts republishing work
 	// the worker is in the middle of.
@@ -358,12 +359,29 @@ func (c Config) validate() []error {
 	}
 	// The one setting here that can cause an oversell if it is wrong. A
 	// reservation released while its sale is still in flight hands the same
-	// seat to two people, so this must comfortably exceed the request budget
-	// rather than merely exceed it.
-	if c.ReservationAge <= c.RequestTimeout {
+	// seat to two people.
+	//
+	// The obvious bound is REQUEST_TIMEOUT, and it is not enough. The sweeper
+	// releases on the strength of PostgreSQL not knowing about the sale, and
+	// PostgreSQL can still be catching up after the request has gone: a
+	// COMMIT abandoned when the budget expired may yet be applied by a server
+	// that never heard the caller give up, which is the whole reason
+	// store.ErrOutcomeUnknown exists and the reason a sale ending that way is
+	// deliberately left for the sweeper to resolve. Until that commit lands,
+	// "PostgreSQL has never heard of this sale" is a true answer about a sale
+	// that is about to exist.
+	//
+	// So the margin is the request budget plus one more full database budget:
+	// a server still finishing work the request gave up on, a whole
+	// POSTGRES_TIMEOUT later, is wedged rather than slow, and a wedged server
+	// is not answering the sweeper's question either. Requiring merely
+	// "longer than REQUEST_TIMEOUT" allowed a ten second budget beside a
+	// eleven second reservation age, which is one second of margin for an
+	// event that has no bound.
+	if minimum := c.RequestTimeout + c.PostgresTimeout; c.ReservationAge < minimum {
 		errs = append(errs, fmt.Errorf(
-			"RESERVATION_AGE (%s) must be longer than REQUEST_TIMEOUT (%s), or a sale still in flight can have its ticket taken back",
-			c.ReservationAge, c.RequestTimeout))
+			"RESERVATION_AGE (%s) must be at least REQUEST_TIMEOUT + POSTGRES_TIMEOUT (%s + %s = %s), or a sale whose commit is still landing can have its ticket taken back",
+			c.ReservationAge, c.RequestTimeout, c.PostgresTimeout, minimum))
 	}
 	if c.PendingAge <= 0 {
 		errs = append(errs, fmt.Errorf("PENDING_AGE must be positive, got %s", c.PendingAge))
