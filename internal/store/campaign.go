@@ -16,6 +16,23 @@ import (
 // working across locales and server versions.
 const uniqueViolation = "23505"
 
+// ErrOutcomeUnknown means a write may or may not have been applied.
+//
+// Every failure before COMMIT is unambiguous: the deferred rollback runs and
+// nothing was written. COMMIT is the one point where that stops being true. The
+// server may have committed and lost the acknowledgement on the way back, or —
+// far more likely under load — the caller's context may have expired while the
+// server was busy applying it, in which case pgx abandons a connection that is
+// still going to finish the job.
+//
+// A caller that cannot tell "it failed" from "I did not hear" must not undo
+// anything, and this error exists to stop it trying. The sharper rule would be
+// that a *pgconn.PgError at COMMIT proves a rollback, because the server did
+// answer — but reaching that needs a deferred constraint, this schema has none,
+// and a branch no test can enter is worth less than the sentence saying why it
+// is absent.
+var ErrOutcomeUnknown = errors.New("transaction outcome unknown")
+
 // CampaignState is everything the startup reconciliation needs in order to
 // rebuild Redis: how large the campaign is, and exactly who already holds a
 // ticket.
@@ -158,7 +175,7 @@ func (s *Store) RecordPurchase(ctx context.Context, campaignID, userID string) (
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Purchase{}, fmt.Errorf("commit purchase: %w", err)
+		return domain.Purchase{}, fmt.Errorf("commit purchase: %w: %w", ErrOutcomeUnknown, err)
 	}
 
 	return purchase, nil

@@ -9,6 +9,7 @@ package purchase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -66,10 +67,12 @@ const compensationBudget = 5 * time.Second
 // hold no matter how many requests arrive together.
 //
 // The two writes are not atomic with each other, and cannot be: they are
-// separate systems. This is the gap the whole rest of the project is about. It
-// is narrowed here, not closed — if recording the purchase fails, the ticket is
-// handed back; if the *process dies* between the two, the ticket is gone until
-// something notices. Phase 5 is where something notices.
+// separate systems. This is the gap the whole rest of the project is about, and
+// it is narrowed here rather than closed. If recording the purchase is known to
+// have failed, the ticket is handed back. If it cannot be known — the process
+// dies between the two, or the reply to either write is simply lost — the
+// ticket stays out of circulation until something notices. Phase 5 is where
+// something notices.
 func (s *Service) Purchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error) {
 	outcome, remaining, err := s.cache.Purchase(ctx, campaignID, userID)
 	if err != nil {
@@ -97,6 +100,24 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID string) (doma
 
 	purchase, err := s.store.RecordPurchase(ctx, campaignID, userID)
 	if err != nil {
+		// Hand the ticket back only when the write is known not to have
+		// happened. A failure at COMMIT does not say that, and treating it as
+		// though it did is how a hundred tickets becomes a hundred and one:
+		// if the transaction committed after all, the compensation returns
+		// stock that PostgreSQL has already given away and un-marks a buyer
+		// who really does hold a ticket.
+		//
+		// Doing nothing costs at most one ticket that nobody can buy until
+		// the next reconciliation. That is the direction this system errs in
+		// everywhere else, and the only one of the two that is recoverable.
+		if errors.Is(err, store.ErrOutcomeUnknown) {
+			s.logger.Error("purchase may or may not have been recorded, leaving the ticket out of circulation",
+				slog.String("campaign_id", campaignID),
+				slog.String("user_id", userID),
+				slog.Any("error", err))
+			return domain.Purchase{}, fmt.Errorf("record purchase: %w", err)
+		}
+
 		s.compensate(ctx, campaignID, userID, err)
 		return domain.Purchase{}, fmt.Errorf("record purchase: %w", err)
 	}
