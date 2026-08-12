@@ -126,6 +126,13 @@ jobs:
             -e BASE_URL=http://api:8080 -e VUS=50 \
             grafana/k6:latest run /loadtest/ramp.js
 
+      - name: Check the invariants in the source of truth
+        # k6 asserts what it was told; this asserts what is true. The fairness
+        # rule in particular is invisible to the generator — every virtual user
+        # has its own identity, so a run in which one person was sold every
+        # ticket would look perfect from k6 and be the worst possible outcome.
+        run: COMPOSE="docker compose" sh scripts/verify-campaign.sh
+
       - name: Show what the services said if it failed
         if: failure()
         run: docker compose logs --tail 200 api worker
