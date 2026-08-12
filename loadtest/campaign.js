@@ -23,6 +23,20 @@ const rejectedSoldOut = new Counter('rejected_stock_exhausted');
 const rejectedDuplicate = new Counter('rejected_already_purchased');
 const rejectedRateLimit = new Counter('rejected_rate_limited');
 
+// What counts as a failed request, stated explicitly.
+//
+// By default k6 scores any 4xx as a failure, and in this campaign most requests
+// are *supposed* to be 4xx: only 100 of them can win a ticket and the rest are
+// correctly refused. Left alone, http_req_failed reports 100% on a run where
+// the system behaved perfectly, and the threshold below becomes noise that
+// everyone learns to ignore — the same way `status < 500` once turned a run
+// with most connections refused into a pass.
+//
+// The refusals are answers. A status of 0 — no response at all — is not, and
+// remains a failure, which keeps the threshold pointed at the generator and the
+// network, which is the only thing it was ever able to measure.
+http.setResponseCallback(http.expectedStatuses(200, 409, 429));
+
 export const options = {
   scenarios: {
     midnight: {
@@ -35,9 +49,13 @@ export const options = {
     },
   },
   thresholds: {
-    // Deliberately not asserting the invariant yet: phase 1 is expected to
-    // break it, and a red run here would be reporting the known state of the
-    // world rather than a regression. Phase 4 adds the thresholds that fail CI.
+    // With the response callback above, this asserts that the generator
+    // reached the API — not that the API said yes.
+    //
+    // Deliberately not asserting the stock invariant yet: phase 1 is expected
+    // to break it, and a red run here would be reporting the known state of
+    // the world rather than a regression. Phase 4 adds the thresholds that
+    // fail CI.
     http_req_failed: ['rate<0.01'],
   },
 };

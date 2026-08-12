@@ -49,23 +49,32 @@ func (p naivePurchaser) Purchase(ctx context.Context, campaignID, userID string)
 }
 
 // migrationBudget bounds how long startup waits for a database that is not yet
-// accepting connections before giving up and letting the platform restart us.
+// accepting connections, or for a peer instance that is still migrating, before
+// giving up and letting the platform restart us.
 const migrationBudget = 30 * time.Second
 
 // migrate applies the schema, retrying while the database is still coming up.
 func migrate(ctx context.Context, db *store.Store, logger *slog.Logger) (int64, error) {
-	deadline := time.Now().Add(migrationBudget)
+	// The budget has to be a deadline on the call itself, not a clock checked
+	// between attempts. Migrate blocks on a Postgres advisory lock, and
+	// pg_advisory_lock waits for as long as its context allows — so a peer
+	// that holds the lock and is wedged, or one whose session outlived it,
+	// parks this process inside a single attempt forever. Checking the time
+	// afterwards only bounds a sequence of attempts that each fail fast,
+	// which is the case that was never the problem.
+	ctx, cancel := context.WithTimeout(ctx, migrationBudget)
+	defer cancel()
 
 	for attempt := 1; ; attempt++ {
 		version, err := db.Migrate(ctx)
 		if err == nil {
 			return version, nil
 		}
+		// Either the budget ran out or the process is shutting down. Both
+		// are terminal, and both are worth telling apart from the failure
+		// that was being retried, so the message carries all three.
 		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("after %s and %d attempts: %w", migrationBudget, attempt, err)
+			return 0, fmt.Errorf("%w after %d attempts: %w", ctx.Err(), attempt, err)
 		}
 
 		logger.Warn("migration attempt failed, retrying",
@@ -74,7 +83,7 @@ func migrate(ctx context.Context, db *store.Store, logger *slog.Logger) (int64, 
 
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, fmt.Errorf("%w after %d attempts: %w", ctx.Err(), attempt, err)
 		case <-time.After(2 * time.Second):
 		}
 	}
