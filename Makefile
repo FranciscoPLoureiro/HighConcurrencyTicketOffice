@@ -208,6 +208,16 @@ load-test-ramp: ## The CI profile: ramp, 30s plateau, ramp down, with thresholds
 		-v "$(CURDIR)/loadtest":/loadtest \
 		-e BASE_URL=http://api:8080 -e VUS=$(VUS) \
 		$(K6_IMAGE) run /loadtest/ramp.js
+	# k6 counts the answers it got. This counts what the database and Redis
+	# actually hold, which is the invariant — and is the only place the
+	# fairness rule can be checked at all, since every virtual user has its
+	# own identity and the generator would report a clean run even if one
+	# person had been sold every ticket.
+	$(MAKE) verify-campaign
+
+.PHONY: verify-campaign
+verify-campaign: ## Check the campaign invariants in PostgreSQL and Redis
+	COMPOSE="$(COMPOSE)" sh scripts/verify-campaign.sh
 
 .PHONY: load-test-campaign-internal
 load-test-campaign-internal: ## Campaign load test from inside the docker network

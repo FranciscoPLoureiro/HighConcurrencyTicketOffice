@@ -87,6 +87,7 @@ ended up in the dead letter queue.
 | `make cover` | Coverage across the whole suite, integration included |
 | `make load-test-calibrate` | Measure the generator before believing it |
 | `make load-test-ramp` | The CI profile, with thresholds that fail |
+| `make verify-campaign` | Check the invariants in PostgreSQL and Redis |
 | `make load-test-campaign-internal` | The midnight burst, inside the network |
 | `make dashboard` | Render the Grafana dashboard to `docs/` |
 | `make reset` | Truncate, flush, purge and reconcile |
@@ -267,6 +268,79 @@ because the audience is a university behind a handful of NAT addresses.
 This is worth stating plainly because it is the kind of change that looks like
 tuning until a threshold goes green. The test for whether it is: the invariant
 thresholds are untouched, and the run still sells exactly one hundred tickets.
+
+### The run that gates the build
+
+`make reset && make load-test-ramp`, at the declared operating point, unedited:
+
+```
+  █ THRESHOLDS
+    checks
+    ✓ 'rate==1' rate=100.00%
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+    http_reqs
+    ✓ 'count>1000' count=132926
+    purchase_duration{outcome:refused}
+    ✓ 'p(99)<100' p(99)=40.54ms
+    purchase_duration{outcome:sold}
+    ✓ 'p(99)<200' p(99)=77.29ms
+    refusals
+    ✓ 'count>1000' count=132826
+    server_errors
+    ✓ 'count==0' count=0
+    tickets_sold
+    ✓ 'count==100' count=100
+    undocumented_answers
+    ✓ 'count==0' count=0
+
+  █ TOTAL RESULTS
+    checks_succeeded...: 100.00% 398778 out of 398778
+    purchase_duration..: avg=12.83ms med=12.5ms  p(90)=16.89ms p(95)=20.06ms
+      { outcome:sold }.: avg=22.25ms med=21.4ms  p(90)=35.14ms p(95)=43.95ms
+    tickets_sold.......: 100
+    rejected_stock_exhausted: 132826
+    server_errors......: 0
+    http_reqs..........: 132926  3323.398549/s
+```
+
+**Then the invariants, read from the source of truth rather than from k6:**
+
+```
+campaign invariants, read from the source of truth
+  ok   live tickets                           100
+  ok   people holding more than one ticket    0
+  ok   available column                       0
+  ok   redis stock                            0
+  ok   redis buyers                           100
+all invariants hold
+```
+
+That second step is not decoration, and it is not something k6 could do.
+`tickets_sold` counts the answers the generator received; the invariant is what
+the two datastores hold afterwards, and those are different claims. A system
+that answered `202` a hundred and one times and then lost one to a failed write
+would satisfy k6 and be broken.
+
+The fairness rule in particular is **invisible to the generator**. Every virtual
+user has its own identity, so a run in which one person was sold every ticket
+would look flawless from k6 and be the worst outcome the system has. It can only
+be checked by asking the database, which is what `make verify-campaign` does and
+what CI runs immediately after the load test.
+
+It has been checked the only way a check can be: by making it fail. Dropping
+`purchases_one_live_ticket_per_user_idx` and inserting a second live ticket for
+an existing buyer produces
+
+```
+  FAIL live tickets                           101 (want 100)
+  FAIL people holding more than one ticket    1 (want 0)
+```
+
+and exit code 1. Worth noting what happened on the first attempt at that: the
+database refused the insert outright, because the partial unique index added in
+phase 2 is exactly the backstop that stops this reaching the table. The index
+had to be dropped before the invariant could be broken at all.
 
 ### What the dashboard shows
 
