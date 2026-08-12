@@ -88,3 +88,8 @@ jobs:
       # already has Docker, and this cannot break on an action's major bump.
       - name: Build the api image
         run: docker build -f docker/api.Dockerfile -t ticket-office-api:ci .
+
+      # Built here too, because a worker that does not compile into an image is
+      # a deploy that fails at the worst moment rather than in CI.
+      - name: Build the worker image
+        run: docker build -f docker/worker.Dockerfile -t ticket-office-worker:ci .
