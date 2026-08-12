@@ -271,3 +271,53 @@ func TestAnIdempotencyKeyCannotCreateTwoPurchases(t *testing.T) {
 		t.Errorf("%d live tickets after a reused key, want 1", live)
 	}
 }
+
+// Reversing a sale has to give the key back with the ticket.
+//
+// The API answers a failed sale with a 5xx and releases the Idempotency-Key so
+// the caller can send the same request again — that is what a 5xx means and
+// what the key is for. If a cancelled row went on holding its key, that retry
+// would pass the Lua script, reach here, and be refused for a purchase that no
+// longer exists; the caller would be locked out of the only key the system can
+// recognise, permanently, for having followed the documented protocol.
+func TestACancelledPurchaseGivesUpItsIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	openCampaign(t, s, 10)
+
+	key := uuid.NewString()
+	first, err := s.RecordPending(ctx, testCampaign, "student-1", key)
+	if err != nil {
+		t.Fatalf("first RecordPending() = %v", err)
+	}
+
+	// The sale is reversed: the publish was refused, or the worker gave up
+	// and the compensation saga ran. Either way the seat is back on the shelf
+	// and the buyer is free to try again.
+	if _, err := s.CancelPurchase(ctx, first.ID); err != nil {
+		t.Fatalf("CancelPurchase() = %v", err)
+	}
+
+	second, err := s.RecordPending(ctx, testCampaign, "student-1", key)
+	if err != nil {
+		t.Fatalf("retrying with the same key after the sale was reversed = %v, want it to succeed", err)
+	}
+	if second.ID == first.ID {
+		t.Error("the retry reused the cancelled purchase's id")
+	}
+
+	// And the protection the index exists for is untouched: the key that now
+	// belongs to a live purchase cannot produce a second one.
+	if _, err := s.RecordPending(ctx, testCampaign, "student-2", key); !errors.Is(err, domain.ErrIdempotencyKeyReplayed) {
+		t.Errorf("reusing the key while it holds a live purchase = %v, want %v",
+			err, domain.ErrIdempotencyKeyReplayed)
+	}
+
+	live, err := s.CountLiveTickets(ctx, testCampaign)
+	if err != nil {
+		t.Fatalf("CountLiveTickets() = %v", err)
+	}
+	if live != 1 {
+		t.Errorf("%d live tickets after a reversal and a retry, want 1", live)
+	}
+}

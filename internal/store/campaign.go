@@ -175,9 +175,15 @@ func (s *Store) RecordPending(ctx context.Context, campaignID, userID, idempoten
 		// One of two backstops fired. Which one matters, because they mean
 		// opposite things about who was wrong.
 		if pgErr.ConstraintName == idempotencyKeyIndex {
-			// This key already created a purchase, so this is a retry that
-			// got past the idempotency check in Redis — the record expired,
-			// or Redis lost it. The database remembers what Redis forgot.
+			// This key already created a purchase that is still live, so
+			// this is a retry that got past the idempotency check in Redis —
+			// the record expired, or Redis lost it. The database remembers
+			// what Redis forgot.
+			//
+			// Live, not any: the index skips cancelled rows since migration
+			// 00004. A key whose purchase was reversed has nothing left to
+			// replay, and refusing its retry would lock the caller out of
+			// the one key the system can recognise.
 			return domain.Purchase{}, domain.ErrIdempotencyKeyReplayed
 		}
 		// The fairness index fired, which means Redis let through a second
