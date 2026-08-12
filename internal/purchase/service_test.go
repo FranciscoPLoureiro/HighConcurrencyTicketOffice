@@ -10,6 +10,7 @@ import (
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/queue"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
 )
 
@@ -58,6 +59,11 @@ func (d *stubDecider) WithLock(ctx context.Context, _ string, _, _ time.Duration
 // stubRecorder stands in for PostgreSQL.
 type stubRecorder struct {
 	err error
+
+	// cancellations counts the rows reversed, which is how a test tells a
+	// sale that was undone from one merely reported as failed.
+	cancellations int
+	cancelErr     error
 }
 
 func (r *stubRecorder) RecordPending(_ context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
@@ -74,8 +80,38 @@ func (r *stubRecorder) ReadCampaignState(context.Context, string) (store.Campaig
 	return store.CampaignState{}, nil
 }
 
+func (r *stubRecorder) CancelPurchase(_ context.Context, purchaseID string) (domain.Purchase, error) {
+	r.cancellations++
+	if r.cancelErr != nil {
+		return domain.Purchase{}, r.cancelErr
+	}
+	return domain.Purchase{ID: purchaseID, Status: domain.StatusCancelled}, nil
+}
+
+func (r *stubRecorder) ReadPurchase(_ context.Context, campaignID, purchaseID string) (domain.Purchase, error) {
+	return domain.Purchase{ID: purchaseID, CampaignID: campaignID}, nil
+}
+
+// stubFulfiller stands in for RabbitMQ.
+type stubFulfiller struct {
+	sent []queue.TicketMessage
+	err  error
+}
+
+func (f *stubFulfiller) PublishTicket(_ context.Context, message queue.TicketMessage) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.sent = append(f.sent, message)
+	return nil
+}
+
 func newTestService(d *stubDecider, r *stubRecorder) *Service {
-	return New(d, r, slog.New(slog.DiscardHandler))
+	return newTestServiceWith(d, r, &stubFulfiller{})
+}
+
+func newTestServiceWith(d *stubDecider, r *stubRecorder, f *stubFulfiller) *Service {
+	return New(d, r, f, Timeouts{}, slog.New(slog.DiscardHandler))
 }
 
 // A write that is known to have failed must give the ticket back.

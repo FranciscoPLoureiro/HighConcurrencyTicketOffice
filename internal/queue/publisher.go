@@ -9,21 +9,30 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// ErrNotConfirmed means the broker refused to take responsibility for a
-// message, or said nothing about it before the caller's deadline.
-//
-// It is deliberately a single error covering a nack and a timeout, because the
-// caller's options are the same in both cases and neither is a case where the
-// message can be assumed delivered. What the caller must not do is treat it as
-// proof the message was *not* delivered: a confirm that times out may well
-// arrive a moment later, which is why the compensation on the purchase path is
-// careful about which failures it acts on.
-var ErrNotConfirmed = errors.New("broker did not confirm the publish")
+// The three ways a publish fails, split by what a caller may conclude from
+// them. The distinction is the whole reason they are separate errors: undoing
+// a sale on a failure that did not actually happen is how a ticket is sold
+// twice, and refusing to undo one on a failure that did is how a ticket is lost.
+var (
+	// ErrPublishRefused means the broker nacked the message. It is
+	// definitive: the broker considered the message and declined to take
+	// responsibility, usually because it is out of disk or memory. Nothing
+	// holds the message, and a caller may safely undo what it published
+	// about.
+	ErrPublishRefused = errors.New("broker refused the publish")
 
-// ErrUnroutable means the broker accepted the message and had nowhere to put
-// it. Unlike a nack this is unambiguous: the message is gone and no queue holds
-// it, so a caller may safely undo whatever it published about.
-var ErrUnroutable = errors.New("no queue is bound for the message")
+	// ErrPublishUnconfirmed means no answer arrived before the deadline. It
+	// is the ambiguous one. The broker may have taken the message and been
+	// slow to say so, so a caller must not conclude the message is gone —
+	// undoing here can undo a sale that is about to be fulfilled anyway.
+	ErrPublishUnconfirmed = errors.New("broker did not confirm the publish in time")
+
+	// ErrUnroutable means the broker accepted the message and had nowhere to
+	// put it. Definitive, and invisible without mandatory publishing: the
+	// broker acknowledges an unroutable message perfectly happily, having
+	// discarded it.
+	ErrUnroutable = errors.New("no queue is bound for the message")
+)
 
 // Publisher sends messages and waits for the broker to say it has them.
 //
@@ -143,10 +152,10 @@ func (p *Publisher) publish(ctx context.Context, routingKey string, message Tick
 
 	acked, err := confirmation.WaitContext(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrNotConfirmed, err)
+		return fmt.Errorf("%w: %w", ErrPublishUnconfirmed, err)
 	}
 	if !acked {
-		return fmt.Errorf("%w: nacked by the broker", ErrNotConfirmed)
+		return fmt.Errorf("%w: %s", ErrPublishRefused, routingKey)
 	}
 
 	// The return, if there is one, always precedes the acknowledgement on

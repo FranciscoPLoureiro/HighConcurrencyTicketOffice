@@ -5,11 +5,14 @@ package purchase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/correlation"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/queue"
 )
 
 // The test the whole phase exists to pass.
@@ -201,5 +204,149 @@ func TestAnUnreconciledCampaignIsNotReportedAsSoldOut(t *testing.T) {
 	_, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey())
 	if !errors.Is(err, domain.ErrCampaignNotFound) {
 		t.Errorf("purchase against an unreconciled campaign = %v, want %v", err, domain.ErrCampaignNotFound)
+	}
+}
+
+// A sale is not finished when the row is written; it is finished when somebody
+// else has been told to fulfil it.
+//
+// Without this assertion the whole phase could be inert — rows piling up as
+// pending, no message ever published, and every other test in this file still
+// passing because they only look at Redis and PostgreSQL.
+func TestEverySoldTicketIsHandedOverForFulfilment(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.openCampaign(t, 10)
+
+	const contenders = 25
+	var sold int
+
+	for i := range contenders {
+		if _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); err == nil {
+			sold++
+		}
+	}
+
+	if sold != 10 {
+		t.Fatalf("sold %d tickets against a stock of 10", sold)
+	}
+	if queued := h.published.count(); queued != sold {
+		t.Errorf("%d tickets were sold and %d were queued for fulfilment", sold, queued)
+	}
+}
+
+// The message carries what the worker needs to do its job and to be found in
+// the logs afterwards.
+func TestTheQueuedMessageCarriesTheKeysThatIdentifyThePurchase(t *testing.T) {
+	ctx := correlation.WithID(context.Background(), "correlation-under-test")
+	h := newHarness(t)
+	h.openCampaign(t, 1)
+
+	key := newKey()
+	purchase, err := h.service.Purchase(ctx, testCampaign, "student-1", key)
+	if err != nil {
+		t.Fatalf("Purchase() = %v", err)
+	}
+
+	sent := h.published.messages()
+	if len(sent) != 1 {
+		t.Fatalf("%d messages were published, want 1", len(sent))
+	}
+
+	switch {
+	case sent[0].PurchaseID != purchase.ID:
+		t.Errorf("message names purchase %q, want %q", sent[0].PurchaseID, purchase.ID)
+	case sent[0].IdempotencyKey != key:
+		t.Errorf("message carries key %q, want %q", sent[0].IdempotencyKey, key)
+	case sent[0].CorrelationID != "correlation-under-test":
+		t.Errorf("message carries correlation id %q, want the request's", sent[0].CorrelationID)
+	}
+}
+
+// A publish the broker definitively refused undoes the sale.
+//
+// The ticket was decremented and the row written, and nothing is ever going to
+// fulfil it. Leaving it alone would quietly end the campaign one ticket short
+// for every refused publish, and leave a person holding a purchase that never
+// progresses past pending.
+func TestASaleTheBrokerRefusedIsUndoneCompletely(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.openCampaign(t, 5)
+
+	h.published.fail(fmt.Errorf("%w: disk alarm", queue.ErrPublishRefused))
+
+	if _, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey()); err == nil {
+		t.Fatal("Purchase() = nil, want the publish failure to surface")
+	}
+
+	// The ticket is back on the shelf.
+	remaining, _, err := h.cache.Remaining(ctx, testCampaign)
+	if err != nil {
+		t.Fatalf("Remaining() = %v", err)
+	}
+	if remaining != 5 {
+		t.Errorf("redis has %d tickets after a refused publish, want 5", remaining)
+	}
+
+	// PostgreSQL agrees, both in the rows and in the counter beside them.
+	live, err := h.store.CountLiveTickets(ctx, testCampaign)
+	if err != nil {
+		t.Fatalf("CountLiveTickets() = %v", err)
+	}
+	if live != 0 {
+		t.Errorf("%d live tickets after a refused publish, want 0", live)
+	}
+
+	state, err := h.store.ReadCampaignState(ctx, testCampaign)
+	if err != nil {
+		t.Fatalf("ReadCampaignState() = %v", err)
+	}
+	if !state.Consistent() {
+		t.Errorf("counter says %d available, the rows say %d",
+			state.Available, state.Total-len(state.Buyers))
+	}
+
+	// And the buyer is free to try again, which is the point of undoing it.
+	h.published.fail(nil)
+	if _, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey()); err != nil {
+		t.Errorf("purchase after the reversal = %v, want success", err)
+	}
+}
+
+// A publish that was never confirmed is left alone.
+//
+// The broker may have taken the message and been slow to say so. Undoing here
+// would cancel a purchase a worker is about to fulfil, which is the same
+// mistake as compensating an unknown commit and produces the same result: two
+// people in one seat.
+func TestASaleWithAnUnconfirmedPublishIsLeftPending(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.openCampaign(t, 5)
+
+	h.published.fail(fmt.Errorf("%w: %w", queue.ErrPublishUnconfirmed, context.DeadlineExceeded))
+
+	if _, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey()); err == nil {
+		t.Fatal("Purchase() = nil, want the publish failure to surface")
+	}
+
+	// The ticket stays out of circulation: undersold by one, which is the
+	// recoverable direction.
+	remaining, _, err := h.cache.Remaining(ctx, testCampaign)
+	if err != nil {
+		t.Fatalf("Remaining() = %v", err)
+	}
+	if remaining != 4 {
+		t.Errorf("redis has %d tickets after an unconfirmed publish, want 4", remaining)
+	}
+
+	live, err := h.store.CountLiveTickets(ctx, testCampaign)
+	if err != nil {
+		t.Fatalf("CountLiveTickets() = %v", err)
+	}
+	if live != 1 {
+		t.Errorf("%d live tickets after an unconfirmed publish, want 1 — "+
+			"cancelling here can undo a sale that is about to be fulfilled", live)
 	}
 }

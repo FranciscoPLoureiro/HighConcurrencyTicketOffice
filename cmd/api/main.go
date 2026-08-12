@@ -18,6 +18,7 @@ import (
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/health"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/httpapi"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/purchase"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/queue"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
 )
 
@@ -82,6 +83,61 @@ func migrate(ctx context.Context, db *store.Store, logger *slog.Logger) (int64, 
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// brokerDialBudget bounds how long startup waits for RabbitMQ.
+//
+// Longer than the database's, because the Erlang VM takes far longer to become
+// useful than PostgreSQL does and a cold `docker compose up` routinely spends
+// forty seconds there while doing nothing wrong.
+const brokerDialBudget = 90 * time.Second
+
+// dialBroker connects and declares the topology, retrying while the broker is
+// still coming up.
+func dialBroker(ctx context.Context, url string, logger *slog.Logger) (*queue.Connection, error) {
+	ctx, cancel := context.WithTimeout(ctx, brokerDialBudget)
+	defer cancel()
+
+	for attempt := 1; ; attempt++ {
+		conn, err := queue.Dial(ctx, url)
+		if err == nil {
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w after %d attempts: %w", ctx.Err(), attempt, err)
+		}
+
+		logger.Warn("rabbitmq not ready, retrying",
+			slog.Int("attempt", attempt),
+			slog.Any("error", err))
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w after %d attempts: %w", ctx.Err(), attempt, err)
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// withRequestTimeout puts a deadline on every request before any handler sees
+// it.
+//
+// The per-dependency budgets inside the service bound each outbound call; this
+// bounds the whole. Without it a request that somehow passes every individual
+// check can still sit forever, and the goroutine serving it keeps its pool
+// connection and its idempotency claim for exactly as long.
+//
+// http.TimeoutHandler is not used because it writes its own plain-text 503 over
+// whatever the handler produced, which would break the JSON error contract
+// every other refusal honours. Cancelling the context instead lets the handler
+// fail in its own vocabulary.
+func withRequestTimeout(budget time.Duration, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), budget)
+		defer cancel()
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // probeSelf performs the container healthcheck and returns a process exit code.
@@ -165,7 +221,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, cfg.PostgresDSN)
+	db, err := store.Open(ctx, cfg.PostgresDSN, store.DefaultPoolConfig)
 	if err != nil {
 		return fmt.Errorf("open postgres: %w", err)
 	}
@@ -178,7 +234,36 @@ func run() error {
 		}
 	}()
 
-	sales := purchase.New(redis, db, logger)
+	// The broker is the one dependency that cannot be opened lazily: AMQP has
+	// no lazy dial, and a process that has not declared its topology cannot
+	// know whether publishing would work. Retried rather than fatal on the
+	// first attempt, because RabbitMQ's Erlang VM routinely takes half a
+	// minute longer to become useful than the rest of the stack.
+	broker, err := dialBroker(ctx, cfg.RabbitMQURL, logger)
+	if err != nil {
+		return fmt.Errorf("open rabbitmq: %w", err)
+	}
+	defer func() {
+		if err := broker.Close(); err != nil {
+			logger.Warn("closing rabbitmq", slog.Any("error", err))
+		}
+	}()
+
+	publisher, err := queue.NewPublisher(broker, cfg.PublisherChannels)
+	if err != nil {
+		return fmt.Errorf("open publisher: %w", err)
+	}
+	defer func() {
+		if err := publisher.Close(); err != nil {
+			logger.Warn("closing publisher", slog.Any("error", err))
+		}
+	}()
+
+	sales := purchase.New(redis, db, publisher, purchase.Timeouts{
+		Redis:    cfg.RedisTimeout,
+		Postgres: cfg.PostgresTimeout,
+		Publish:  cfg.PublishTimeout,
+	}, logger)
 
 	if err := prepare(ctx, cfg, db, sales, logger); err != nil {
 		return err
@@ -187,11 +272,12 @@ func run() error {
 	checker := health.New(
 		health.Probe{Name: "postgres", Ping: db.Ping},
 		health.Probe{Name: "redis", Ping: redis.Ping},
+		health.Probe{Name: "rabbitmq", Ping: broker.Ping},
 	)
 
 	srv := &http.Server{
 		Addr: cfg.HTTPAddr,
-		Handler: httpapi.New(httpapi.Config{
+		Handler: withRequestTimeout(cfg.RequestTimeout, httpapi.New(httpapi.Config{
 			Health:       checker,
 			Purchaser:    sales,
 			CampaignID:   cfg.CampaignID,
@@ -206,7 +292,7 @@ func run() error {
 				Retention: cfg.IdempotencyRetention,
 			},
 			IdempotencyKey: cache.IdempotencyKey,
-		}).Routes(),
+		}).Routes()),
 		// Every timeout is set explicitly. The zero value for each of
 		// these is "no limit", which leaves a public listener one slow
 		// client away from holding a connection open indefinitely.

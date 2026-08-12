@@ -15,10 +15,12 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/queue"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
 	"github.com/google/uuid"
 	"github.com/testcontainers/testcontainers-go"
@@ -35,9 +37,54 @@ type harness struct {
 	service *Service
 	store   *store.Store
 	cache   *cache.Cache
+	// published collects every ticket the service handed over, which is how
+	// a test asserts that a sale was actually queued rather than only
+	// recorded.
+	published *recordingFulfiller
 	// redisAddr lets a test build a second, independent client — which is
 	// how a process restart is simulated without restarting anything.
 	redisAddr string
+}
+
+// recordingFulfiller stands in for RabbitMQ.
+//
+// These tests are about the two systems that decide and remember; the broker
+// gets its own suite against a real one in internal/queue, where atomicity and
+// confirms are the point. Here it only has to record what it was given and, on
+// request, fail in a specified way so the compensation paths can be reached.
+type recordingFulfiller struct {
+	mu   sync.Mutex
+	sent []queue.TicketMessage
+	err  error
+}
+
+func (f *recordingFulfiller) PublishTicket(_ context.Context, message queue.TicketMessage) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return f.err
+	}
+	f.sent = append(f.sent, message)
+	return nil
+}
+
+func (f *recordingFulfiller) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent)
+}
+
+func (f *recordingFulfiller) messages() []queue.TicketMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]queue.TicketMessage(nil), f.sent...)
+}
+
+func (f *recordingFulfiller) fail(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 func newHarness(t *testing.T) *harness {
@@ -46,11 +93,13 @@ func newHarness(t *testing.T) *harness {
 	db := startPostgres(t)
 	addr := startRedis(t)
 	redis := openCache(t, addr)
+	published := &recordingFulfiller{}
 
 	return &harness{
-		service:   New(redis, db, slog.New(slog.DiscardHandler)),
+		service:   New(redis, db, published, Timeouts{}, slog.New(slog.DiscardHandler)),
 		store:     db,
 		cache:     redis,
+		published: published,
 		redisAddr: addr,
 	}
 }
@@ -78,7 +127,7 @@ func (h *harness) openCampaign(t *testing.T, total int) {
 func (h *harness) restart(t *testing.T) *Service {
 	t.Helper()
 
-	return New(openCache(t, h.redisAddr), h.store, slog.New(slog.DiscardHandler))
+	return New(openCache(t, h.redisAddr), h.store, h.published, Timeouts{}, slog.New(slog.DiscardHandler))
 }
 
 func startPostgres(t *testing.T) *store.Store {
@@ -113,7 +162,7 @@ func startPostgres(t *testing.T) *store.Store {
 		t.Fatalf("building connection string: %v", err)
 	}
 
-	db, err := store.Open(ctx, dsn)
+	db, err := store.Open(ctx, dsn, store.DefaultPoolConfig)
 	if err != nil {
 		t.Fatalf("opening store: %v", err)
 	}

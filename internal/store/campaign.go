@@ -280,6 +280,59 @@ func (s *Store) SettlePurchase(ctx context.Context, purchaseID string, status do
 	}
 }
 
+// CancelPurchase reverses a purchase and puts its ticket back on the counter.
+//
+// Two writes in one transaction, because they are one fact: the row stops
+// holding a seat and the seat becomes available again. Split apart, a failure
+// between them leaves a campaign whose counter and rows disagree, which is
+// exactly what ReadCampaignState checks for and complains about.
+//
+// Idempotent, and it has to be for the same reason release.lua is: everything
+// that reaches for this is already on a path where something went wrong once
+// and may go wrong twice. The guard is in the WHERE clause, so the second call
+// updates no rows and therefore increments nothing. Written as a read followed
+// by a write it would be the bug the brief warns about — "if the compensation
+// runs twice the stock increments twice and you now have 101 tickets" — and the
+// reason it is not is that the test and the increment are the same statement.
+func (s *Store) CancelPurchase(ctx context.Context, purchaseID string) (domain.Purchase, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Purchase{}, fmt.Errorf("begin cancellation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	purchase, err := scanPurchase(tx.QueryRow(ctx, `
+		UPDATE purchases SET status = $2, updated_at = now()
+		WHERE id = $1 AND status <> $2
+		RETURNING `+purchaseColumns,
+		purchaseID, domain.StatusCancelled))
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Either it is already cancelled — which is this function having
+		// already run, and not a failure — or there is no such purchase.
+		current, readErr := s.readPurchaseByID(ctx, purchaseID)
+		if readErr != nil {
+			return domain.Purchase{}, readErr
+		}
+		return current, nil
+	}
+	if err != nil {
+		return domain.Purchase{}, fmt.Errorf("cancel purchase: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE tickets SET available = available + 1 WHERE campaign_id = $1`,
+		purchase.CampaignID); err != nil {
+		return domain.Purchase{}, fmt.Errorf("return ticket to the counter: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Purchase{}, fmt.Errorf("commit cancellation: %w: %w", ErrOutcomeUnknown, err)
+	}
+
+	return purchase, nil
+}
+
 func (s *Store) readPurchaseByID(ctx context.Context, purchaseID string) (domain.Purchase, error) {
 	purchase, err := scanPurchase(s.pool.QueryRow(ctx,
 		`SELECT `+purchaseColumns+` FROM purchases WHERE id = $1`, purchaseID))

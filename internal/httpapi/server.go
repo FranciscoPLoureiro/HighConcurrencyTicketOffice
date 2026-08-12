@@ -19,6 +19,7 @@ import (
 // against every refusal reason without a database.
 type Purchaser interface {
 	Purchase(ctx context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error)
+	ReadPurchase(ctx context.Context, campaignID, purchaseID string) (domain.Purchase, error)
 }
 
 // Config carries the Server's dependencies.
@@ -104,6 +105,11 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", s.handleHealth)
+
+	// Every request gets a correlation id before anything else looks at it,
+	// including the ones that are about to be refused: "why did this caller
+	// get a 429?" is a question worth being able to answer, and it cannot be
+	// asked of a line with nothing to join on.
 	// Identity is required for the purchase path and meaningless for health,
 	// so the middleware wraps the one route rather than the whole mux. The
 	// rate limit sits inside the identity check, which is what lets it key
@@ -115,7 +121,14 @@ func (s *Server) Routes() http.Handler {
 	// near it. The other order would make a claimed key the cheapest way to
 	// bypass the limiter.
 	mux.Handle("POST /api/v1/tickets/purchase",
-		withIdentity(s.withRateLimit(s.withIdempotency(http.HandlerFunc(s.handlePurchase)))))
+		withCorrelationID(withIdentity(s.withRateLimit(
+			s.withIdempotency(http.HandlerFunc(s.handlePurchase))))))
+
+	// Where a caller watches the purchase the 202 promised them. No rate
+	// limit and no idempotency: it takes nothing, changes nothing, and
+	// polling it is the behaviour the 202 asked for.
+	mux.Handle("GET /api/v1/tickets/{id}/status",
+		withCorrelationID(withIdentity(http.HandlerFunc(s.handlePurchaseStatus))))
 
 	return mux
 }
