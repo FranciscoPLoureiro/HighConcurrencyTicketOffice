@@ -4,14 +4,16 @@
 
 A student festival releases exactly **100 tickets at 80% off**, and the campaign
 opens at midnight. Around **5,000 people** press *Buy* inside the same few
-seconds. This is the backend that sells those tickets without ever selling 101,
-without letting one person take two, and without losing a ticket if a process
-dies halfway through a purchase.
+seconds. This is the backend that sells those tickets without ever selling 101
+and without letting one person take two — both of which it now does — and,
+eventually, without losing a ticket when a process dies halfway through a
+purchase.
 
-The last of those is the interesting one. The stock lives in Redis and the
-fulfilment work lives in RabbitMQ; they are separate systems that fail
-independently, so "decrement the stock, then publish the job" has a gap in the
-middle where a ticket can vanish. Most of this repository is about that gap.
+That last one is the interesting problem, and it is the one still open. The
+stock lives in Redis and the fulfilment work will live in RabbitMQ: separate
+systems that fail independently, so "decrement the stock, then publish the job"
+has a gap in the middle where a ticket can vanish. Phase 5 is about that gap.
+The table below says what has actually landed.
 
 ## Status
 
@@ -27,8 +29,8 @@ request.
 | 4 | Prometheus, Grafana, calibrated load testing | ⬜ |
 | 5 | The lost ticket, compensation saga, failure modes | ⬜ |
 
-Sections below marked *(phase N)* describe work that has not landed yet and are
-listed so the shape of the system is visible from the start.
+The architecture diagram draws the unbuilt parts with dashed lines, so the shape
+of the finished system is visible without any of it being claimed as done.
 
 ## Quick start
 
