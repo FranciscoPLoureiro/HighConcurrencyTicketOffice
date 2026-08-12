@@ -44,6 +44,11 @@ type harness struct {
 	// redisAddr lets a test build a second, independent client — which is
 	// how a process restart is simulated without restarting anything.
 	redisAddr string
+	// redisContainer lets a test take Redis away mid-flight. The brief asks
+	// for exactly this: Testcontainers can stop a container during a test,
+	// and the behaviour when the one system enforcing the stock invariant
+	// disappears is worth proving rather than asserting.
+	redisContainer testcontainers.Container
 }
 
 // recordingFulfiller stands in for RabbitMQ.
@@ -91,16 +96,17 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 
 	db := startPostgres(t)
-	addr := startRedis(t)
+	addr, container := startRedis(t)
 	redis := openCache(t, addr)
 	published := &recordingFulfiller{}
 
 	return &harness{
-		service:   New(redis, db, published, Timeouts{}, slog.New(slog.DiscardHandler)),
-		store:     db,
-		cache:     redis,
-		published: published,
-		redisAddr: addr,
+		service:        New(redis, db, published, Timeouts{}, slog.New(slog.DiscardHandler)),
+		store:          db,
+		cache:          redis,
+		published:      published,
+		redisAddr:      addr,
+		redisContainer: container,
 	}
 }
 
@@ -175,7 +181,7 @@ func startPostgres(t *testing.T) *store.Store {
 	return db
 }
 
-func startRedis(t *testing.T) string {
+func startRedis(t *testing.T) (string, testcontainers.Container) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -199,7 +205,7 @@ func startRedis(t *testing.T) string {
 		t.Fatalf("reading redis port: %v", err)
 	}
 
-	return net.JoinHostPort(host, port.Port())
+	return net.JoinHostPort(host, port.Port()), container
 }
 
 func openCache(t *testing.T, addr string) *cache.Cache {
