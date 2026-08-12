@@ -15,9 +15,9 @@ import (
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/config"
-	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/health"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/httpapi"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/purchase"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
 )
 
@@ -36,17 +36,12 @@ func main() {
 	}
 }
 
-// naivePurchaser adapts the phase 1 storage method to the handler's interface.
-//
-// This is the seam the project turns on. Phase 2 replaces this one type with
-// the Redis-backed purchaser and nothing in the transport layer changes, which
-// is what makes the before-and-after measurement a fair comparison: the same
-// handler, the same routes, the same client.
-type naivePurchaser struct{ *store.Store }
-
-func (p naivePurchaser) Purchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error) {
-	return p.PurchaseNaively(ctx, campaignID, userID)
-}
+// startupBudget bounds everything between opening the dependencies and
+// listening: migrations, creating the campaign, and reconciling Redis. Each of
+// those can block on something outside this process — an advisory lock, a row
+// lock, a distributed lock held by a peer — and a deploy that hangs with no
+// listener and no explanation is worse than one that exits and is restarted.
+const startupBudget = 2 * time.Minute
 
 // migrationBudget bounds how long startup waits for a database that is not yet
 // accepting connections, or for a peer instance that is still migrating, before
@@ -119,6 +114,40 @@ func probeSelf() int {
 	return 0
 }
 
+// prepare brings the system to a state where it can sell a ticket.
+//
+// All three steps block startup, and all three should. A process with no
+// schema, no campaign row, or a Redis that has not been reconciled cannot serve
+// a correct purchase, so there is nothing to stay up for — and the third one is
+// the reason this function exists as a unit: serving before reconciliation
+// finishes means answering with whatever the last run happened to leave behind.
+func prepare(ctx context.Context, cfg config.Config, db *store.Store, sales *purchase.Service, logger *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(ctx, startupBudget)
+	defer cancel()
+
+	// Retries rather than exiting on the first failure because a rolling
+	// deploy routinely starts the app seconds before the database begins
+	// accepting connections, and a crash loop there is noise, not signal.
+	version, err := migrate(ctx, db, logger)
+	if err != nil {
+		return fmt.Errorf("migrate schema: %w", err)
+	}
+	logger.Info("schema up to date", slog.Int64("version", version))
+
+	if err := db.EnsureCampaign(ctx, cfg.CampaignID, cfg.TotalTickets); err != nil {
+		return fmt.Errorf("ensure campaign: %w", err)
+	}
+
+	// The most important line in this function. Without it, restarting the
+	// service mid-campaign either resells tickets that are already gone or
+	// forgets who holds one.
+	if _, err := sales.Reconcile(ctx, cfg.CampaignID); err != nil {
+		return fmt.Errorf("reconcile stock: %w", err)
+	}
+
+	return nil
+}
+
 // run exists so that main can exit non-zero without skipping cleanup:
 // os.Exit does not run deferred functions.
 func run() error {
@@ -142,27 +171,18 @@ func run() error {
 	}
 	defer db.Close()
 
-	// Unlike the health probes, this does block startup: a process with no
-	// schema cannot serve anything, so there is nothing to stay up for. It
-	// retries rather than exiting on the first failure because a rolling
-	// deploy routinely starts the app seconds before the database begins
-	// accepting connections, and a crash loop there is noise, not signal.
-	version, err := migrate(ctx, db, logger)
-	if err != nil {
-		return fmt.Errorf("migrate schema: %w", err)
-	}
-	logger.Info("schema up to date", slog.Int64("version", version))
-
-	if err := db.EnsureCampaign(ctx, cfg.CampaignID, cfg.TotalTickets); err != nil {
-		return fmt.Errorf("ensure campaign: %w", err)
-	}
-
 	redis := cache.Open(cfg.RedisAddr, cfg.RedisPassword)
 	defer func() {
 		if err := redis.Close(); err != nil {
 			logger.Warn("closing redis", slog.Any("error", err))
 		}
 	}()
+
+	sales := purchase.New(redis, db, logger)
+
+	if err := prepare(ctx, cfg, db, sales, logger); err != nil {
+		return err
+	}
 
 	checker := health.New(
 		health.Probe{Name: "postgres", Ping: db.Ping},
@@ -172,10 +192,14 @@ func run() error {
 	srv := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.New(httpapi.Config{
-			Health:     checker,
-			Purchaser:  naivePurchaser{db},
-			CampaignID: cfg.CampaignID,
-			Logger:     logger,
+			Health:       checker,
+			Purchaser:    sales,
+			CampaignID:   cfg.CampaignID,
+			Logger:       logger,
+			Limiter:      redis,
+			UserLimit:    httpapi.Policy{Limit: cfg.RateLimitUser, Window: cfg.RateLimitWindow},
+			IPLimit:      httpapi.Policy{Limit: cfg.RateLimitIP, Window: cfg.RateLimitWindow},
+			RateLimitKey: cache.RateLimitKey,
 		}).Routes(),
 		// Every timeout is set explicitly. The zero value for each of
 		// these is "no limit", which leaves a public listener one slow

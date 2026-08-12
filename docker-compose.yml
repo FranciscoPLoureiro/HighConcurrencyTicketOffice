@@ -64,6 +64,32 @@ services:
 
   redis:
     image: redis:8-alpine
+    # Persistence is configured rather than left to the image default, which
+    # is RDB snapshots alone: with those, a crash loses every write since the
+    # last snapshot, and the default schedule measures that in minutes. For a
+    # campaign that is decided in the first few seconds, a snapshot taken
+    # minutes ago is the same as no snapshot.
+    #
+    # AOF with everysec bounds the loss at roughly one second of writes. Not
+    # zero — `always` would be, at the cost of an fsync on the critical path of
+    # every purchase, which is the one path this design spends effort keeping
+    # fast. One second of tickets is recoverable; the latency is not.
+    #
+    # Both are on, because they answer different questions: the AOF is what
+    # replays after a crash, and the RDB is the compact file worth copying
+    # somewhere else.
+    #
+    # None of this is what makes the system correct after Redis dies. The AOF
+    # narrows the gap; startup reconciliation from PostgreSQL closes it, and
+    # would close it just as well if the AOF were empty.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60 1000"
     ports:
       - "6379:6379"
     volumes:

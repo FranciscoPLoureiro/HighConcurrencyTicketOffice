@@ -39,12 +39,18 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("CAMPAIGN_ID", "noites-do-parque")
 	t.Setenv("TOTAL_TICKETS", "250")
+	t.Setenv("RATE_LIMIT_WINDOW", "30s")
+	t.Setenv("RATE_LIMIT_USER", "3")
+	t.Setenv("RATE_LIMIT_IP", "400")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() = %v, want no error", err)
 	}
 
+	// Compared as a whole struct rather than field by field, so that a field
+	// added to Config without being wired into Load fails here instead of
+	// silently defaulting in production.
 	want := Config{
 		HTTPAddr:        ":9999",
 		PostgresDSN:     "postgres://elsewhere/db",
@@ -54,6 +60,9 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 		LogLevel:        slog.LevelDebug,
 		CampaignID:      "noites-do-parque",
 		TotalTickets:    250,
+		RateLimitWindow: 30 * time.Second,
+		RateLimitUser:   3,
+		RateLimitIP:     400,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v, want %+v", cfg, want)
@@ -152,6 +161,27 @@ func TestNonPositiveTicketCountIsRejected(t *testing.T) {
 	}
 }
 
+// Zero disables a rate limit deliberately. A negative value is a typo that
+// reads as "disabled", which is how a control someone believed was on quietly
+// stops being on.
+func TestNegativeRateLimitsAreRejectedButZeroIsNot(t *testing.T) {
+	for _, key := range []string{"RATE_LIMIT_USER", "RATE_LIMIT_IP"} {
+		t.Run(key, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(key, "-1")
+			if _, err := Load(); err == nil {
+				t.Errorf("Load() accepted %s=-1", key)
+			}
+
+			clearEnv(t)
+			t.Setenv(key, "0")
+			if _, err := Load(); err != nil {
+				t.Errorf("Load() rejected %s=0, which must mean disabled: %v", key, err)
+			}
+		})
+	}
+}
+
 func TestNonPositiveShutdownTimeoutIsRejected(t *testing.T) {
 	clearEnv(t)
 	// Zero would make graceful shutdown a no-op, quietly turning every
@@ -177,6 +207,9 @@ func clearEnv(t *testing.T) {
 		"LOG_LEVEL",
 		"CAMPAIGN_ID",
 		"TOTAL_TICKETS",
+		"RATE_LIMIT_WINDOW",
+		"RATE_LIMIT_USER",
+		"RATE_LIMIT_IP",
 	} {
 		t.Setenv(key, "")
 	}

@@ -5,10 +5,15 @@
 //
 //   make reset && make load-test-campaign
 //
-// VUS defaults to the brief's 100. To see the phase 1 race through HTTP rather
-// than through the integration test, it has to exceed the campaign size —
-// 100 requests against 100 tickets cannot oversell no matter how broken the
-// code is. VUS=500 is what produced the numbers in the README.
+// VUS defaults to the brief's 100, and has to exceed the campaign size to test
+// anything: 100 requests against 100 tickets cannot oversell no matter how
+// broken the code is, and cannot demonstrate a limit holding either. VUS=500 is
+// what produced both columns of the comparison table in the README.
+//
+// Raising VUS past RATE_LIMIT_IP is worth knowing about: every virtual user
+// comes from this one container, so the generator starts rate limiting itself
+// and the tickets it fails to buy are counted under rejected_rate_limited
+// rather than lost.
 import http from 'k6/http';
 import { check } from 'k6';
 import { Counter } from 'k6/metrics';
@@ -52,10 +57,10 @@ export const options = {
     // With the response callback above, this asserts that the generator
     // reached the API — not that the API said yes.
     //
-    // Deliberately not asserting the stock invariant yet: phase 1 is expected
-    // to break it, and a red run here would be reporting the known state of
-    // the world rather than a regression. Phase 4 adds the thresholds that
-    // fail CI.
+    // The stock invariant is not asserted here yet, even though it now holds:
+    // this script is run by hand, and a threshold that nothing enforces is a
+    // comment with extra syntax. Phase 4 wires the run into CI and adds the
+    // thresholds that fail it — tickets_sold == 100, no user with two, no 5xx.
     http_req_failed: ['rate<0.01'],
   },
 };
