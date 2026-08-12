@@ -204,6 +204,30 @@ func (c *Connection) Ping(_ context.Context) error {
 	return ch.Close()
 }
 
+// QueueDepth reports how many messages are waiting in a queue.
+//
+// A passive declare rather than the management HTTP API: it needs no second
+// credential, no second port and no second client, and it fails cleanly if the
+// queue is missing instead of inventing one.
+//
+// Worth having beyond the tests that use it. Queue depth is the honest health
+// signal for a worker — a process that is running proves nothing, and a backlog
+// that stops moving proves quite a lot — and it is the number phase 4 puts on a
+// dashboard.
+func (c *Connection) QueueDepth(_ context.Context, name string) (int, error) {
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return 0, fmt.Errorf("open channel: %w", err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	state, err := ch.QueueDeclarePassive(name, true, false, false, false, nil)
+	if err != nil {
+		return 0, fmt.Errorf("inspect queue %q: %w", name, err)
+	}
+	return state.Messages, nil
+}
+
 // Closed reports a channel that is signalled when the connection drops.
 //
 // The worker uses it to notice that its consumer has stopped being fed, which

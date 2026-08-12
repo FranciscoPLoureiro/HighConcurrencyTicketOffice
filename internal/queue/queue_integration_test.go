@@ -274,24 +274,14 @@ func waitForDelivery(t *testing.T, deliveries <-chan Delivery, within time.Durat
 	}
 }
 
-// queueDepth asks the broker how many messages a queue holds.
-//
-// A passive declare is the cheapest way to ask: it creates nothing, fails if
-// the queue is missing, and returns the state of the one that is there.
 func queueDepth(t *testing.T, conn *Connection, name string) int {
 	t.Helper()
 
-	ch, err := conn.conn.Channel()
+	depth, err := conn.QueueDepth(context.Background(), name)
 	if err != nil {
-		t.Fatalf("open channel: %v", err)
+		t.Fatalf("QueueDepth(%q) = %v", name, err)
 	}
-	defer func() { _ = ch.Close() }()
-
-	state, err := ch.QueueDeclarePassive(name, true, false, false, false, nil)
-	if err != nil {
-		t.Fatalf("inspect %q: %v", name, err)
-	}
-	return state.Messages
+	return depth
 }
 
 func waitForQueueDepth(t *testing.T, conn *Connection, name string, want int, within time.Duration) int {
