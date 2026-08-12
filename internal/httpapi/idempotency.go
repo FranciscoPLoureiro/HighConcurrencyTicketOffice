@@ -58,11 +58,19 @@ type IdempotencyPolicy struct {
 // Enabled reports whether the policy does anything.
 func (p IdempotencyPolicy) Enabled() bool { return p.Lease > 0 && p.Retention > 0 }
 
-// storedResponse is the recorded answer, kept whole so a replay is
-// byte-for-byte what the first attempt received.
+// storedResponse is the recorded answer, kept whole so a replay is what the
+// first attempt received rather than a reconstruction of it.
+//
+// Headers are part of "whole". A successful purchase answers 202 with a
+// Location pointing at the status resource, and a replay that dropped it would
+// hand the retry a 202 with nowhere to go — in the one case the client is most
+// likely to be following the header, having never seen the first response at
+// all. Omitted when empty, and absent from records written before this field
+// existed, which decode to no headers and replay as they always did.
 type storedResponse struct {
-	Status int             `json:"status"`
-	Body   json.RawMessage `json:"body"`
+	Status  int                 `json:"status"`
+	Headers map[string][]string `json:"headers,omitempty"`
+	Body    json.RawMessage     `json:"body"`
 }
 
 // capturingWriter records a response on its way out.
@@ -192,6 +200,10 @@ func (s *Server) replay(w http.ResponseWriter, recordKey, stored string) {
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	for name, values := range response.Headers {
+		w.Header()[name] = values
+	}
+	// Last, so that a recorded header cannot claim this was not a replay.
 	w.Header().Set(replayHeader, "true")
 	w.WriteHeader(response.Status)
 
@@ -233,7 +245,11 @@ func (s *Server) record(ctx context.Context, recordKey string, capture *capturin
 		body = []byte("null")
 	}
 
-	encoded, err := json.Marshal(storedResponse{Status: capture.status, Body: body})
+	encoded, err := json.Marshal(storedResponse{
+		Status:  capture.status,
+		Headers: capture.header,
+		Body:    body,
+	})
 	if err != nil {
 		s.logger.Error("could not encode a response for replay",
 			slog.String("key", recordKey),
