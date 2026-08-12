@@ -180,8 +180,14 @@ func (c *Consumer) dispatch(ctx context.Context, handler Handler, settlement Set
 	// closes, and inheriting the cancellation would do the opposite: SIGTERM
 	// would abort the fulfilment halfway, and every deploy would leave a
 	// scattering of tickets to be retried. Stopping means taking no more
-	// work, not dropping the work in hand. What bounds the wait is the
-	// process's own shutdown timeout, which is a decision for the caller.
+	// work, not dropping the work in hand.
+	//
+	// What bounds the wait is this budget and nothing else. Worth saying
+	// plainly, because the number that has the final word is outside the
+	// process entirely: whatever runs the container sends SIGKILL some time
+	// after SIGTERM, and if that grace period is shorter than this budget then
+	// the guarantee above is decoration. docker-compose.yml sets it
+	// accordingly; anything else deploying this has to do the same.
 	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.workTimeout)
 	defer cancel()
 

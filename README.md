@@ -1007,6 +1007,44 @@ waits proving what the first attempt already knew. Nothing consumes the dead
 letter queue — its purpose is to stop and be looked at, and phase 5.3 is where a
 compensation saga drains it.
 
+### Graceful shutdown, and the number that overrides it
+
+**Context.** The brief asks that a deploy not corrupt state: on `SIGTERM` the
+API should stop accepting new requests and finish the ones in flight, and the
+worker should finish the message in its hand before closing. Both processes do
+exactly that. The API traps the signal before it opens a single dependency,
+calls `srv.Shutdown` with `SHUTDOWN_TIMEOUT`, and then waits for the sweeper
+pass to end rather than cutting it off holding the reconciliation lock. The
+worker's consumer stops pulling deliveries and lets the message already
+dispatched run to completion, because the handler's context is deliberately
+detached from the one the signal cancels.
+
+**The part that is easy to miss.** None of that is worth anything if something
+kills the process first, and something always will. Whatever runs the
+container sends `SIGTERM`, waits, and then sends `SIGKILL`; Docker's default
+wait is **ten seconds**. Both processes here are configured to need more than
+that — the API has fifteen seconds of drain budget before the sweeper wait, and
+the worker's per-message budget is `FULFILMENT_DELAY + POSTGRES_TIMEOUT` plus a
+margin, twelve seconds with the defaults. So the graceful shutdown was correct
+in the code and unreachable in practice, on every `compose stop`, every
+`restart`, and every recreate — including the API restart in `scripts/reset.sh`
+that runs before each load test.
+
+**Decision.** `stop_grace_period` is set explicitly on both services, above
+what either process can take. It is a number to keep in step: raising
+`SHUTDOWN_TIMEOUT` or `FULFILMENT_DELAY` without raising it puts the guarantee
+back out of reach, silently.
+
+**Consequences.** Being generous costs nothing, because a process that has
+finished exits immediately and an idle one exits at once — the grace period is
+a ceiling, not a delay. And the failure it prevents was survivable rather than
+catastrophic: a killed worker leaves its message unacknowledged, so the broker
+redelivers it and the idempotent handler absorbs the duplicate. A killed API is
+worse, because a request cut between the Redis decrement and the PostgreSQL
+write is the lost ticket this project is about — recovered by the sweeper or by
+startup reconciliation, but caused by the very deploy that graceful shutdown was
+there to make clean.
+
 ### Sizing the connection pool, with the right knobs
 
 **Context.** The brief asks for an explicitly configured pool with its values
