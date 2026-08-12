@@ -16,8 +16,27 @@ services:
       REDIS_ADDR: redis:6379
       RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
       LOG_LEVEL: info
+      # Overridable from the host, and the load test is the reason. Every
+      # virtual user comes from one container and therefore one address, which
+      # is exactly the traffic shape the per-address limit exists to stop — so
+      # with it on, a campaign-scale run measures the rate limiter and nothing
+      # else. `make load-test-ramp` sets this to 0.
+      #
+      # The per-account limit stays on throughout. That is the one doing the
+      # real work here anyway; the address limit is deliberately loose, because
+      # the audience is a university behind a handful of NAT addresses.
+      RATE_LIMIT_IP: "${RATE_LIMIT_IP:-1000}"
     ports:
       - "8080:8080"
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
     depends_on:
       # Waiting on health rather than on start. The API tolerates a missing
       # dependency by design, but a stack that comes up reporting 503 for the
@@ -53,6 +72,15 @@ services:
       REDIS_ADDR: redis:6379
       RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
       LOG_LEVEL: info
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,6 +95,15 @@ services:
 
   postgres:
     image: postgres:18-alpine
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
     environment:
       POSTGRES_USER: tickets
       POSTGRES_PASSWORD: tickets
@@ -93,6 +130,15 @@ services:
 
   redis:
     image: redis:8-alpine
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
     # Persistence is configured rather than left to the image default, which
     # is RDB snapshots alone: with those, a crash loses every write since the
     # last snapshot, and the default schedule measures that in minutes. For a
@@ -132,6 +178,15 @@ services:
 
   rabbitmq:
     image: rabbitmq:4-management-alpine
+    # Explicit limits, because a load test against an unbounded container
+    # measures the developer's laptop rather than the service. The README
+    # declares the machine these were chosen for; the point is not the numbers
+    # but that the same numbers apply on every run.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     environment:
       RABBITMQ_DEFAULT_USER: tickets
       RABBITMQ_DEFAULT_PASS: tickets
@@ -141,18 +196,103 @@ services:
       # queue by hand while developing phase 3.
       - "15672:15672"
     volumes:
+      # The memory watermark, which has to be a file: RabbitMQ 4 rejects the
+      # equivalent environment variable as deprecated and refuses to start.
+      # See the config for why the value is set at all.
+      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/20-limits.conf:ro
       - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
+      # 15s, not 5. rabbitmq-diagnostics starts an Erlang node to ask the
+      # question, and on the one CPU this container is limited to that takes
+      # about eight seconds — so a five second timeout could never pass, and
+      # the service sat "unhealthy" while answering AMQP perfectly well. The
+      # limit did not break RabbitMQ; it broke the probe.
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
+      interval: 15s
+      timeout: 15s
       # The Erlang VM takes far longer to become useful than the other two.
       # A short start_period here marks the whole stack unhealthy on a cold
       # boot of a machine that is doing nothing wrong.
       retries: 10
       start_period: 40s
 
+  # Observability. Both are provisioned entirely by file — no clicking, no
+  # dashboard saved in somebody's browser, and a screenshot in the README that
+  # anybody can reproduce with one command.
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # A campaign is over in seconds and these are local runs, so there is
+      # nothing to keep for a fortnight.
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    depends_on:
+      api:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    environment:
+      # Anonymous viewing, deliberately. This is a local stack whose only
+      # secret is a throwaway Postgres password, and a login prompt between a
+      # reader and the dashboard is friction with nothing behind it.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: light
+      # Opens straight on the dashboard rather than on an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ticket-office.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Points Grafana at the renderer above when it is running. Harmless when
+      # it is not: the render endpoint fails, and nothing else uses it.
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    depends_on:
+      - prometheus
+
+  # Headless Chromium, so that the dashboard in the README is exported by a
+  # command rather than cropped out of somebody's browser. Behind a profile
+  # because it is a documentation tool and has no business in the stack a load
+  # test measures — `docker compose --profile tools up -d renderer`, or just
+  # `make dashboard`.
+  renderer:
+    image: grafana/grafana-image-renderer:latest
+    profiles: ["tools"]
+    environment:
+      ENABLE_METRICS: "false"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
 volumes:
   postgres-data:
   redis-data:
   rabbitmq-data:
+  prometheus-data:
+  grafana-data:

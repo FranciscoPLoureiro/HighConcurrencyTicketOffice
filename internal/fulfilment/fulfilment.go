@@ -19,15 +19,44 @@ import (
 
 // Settler is the source of truth, as much of it as this package needs.
 type Settler interface {
-	SettlePurchase(ctx context.Context, purchaseID string, status domain.Status) (domain.Purchase, error)
+	SettlePurchase(ctx context.Context, purchaseID string, status domain.Status) (domain.Purchase, bool, error)
 }
+
+// Observer counts fulfilment attempts and times them.
+//
+// Queue latency is the number worth watching here, and it is not the same as
+// fulfilment duration: duration says how long the work takes, latency says how
+// long the ticket waited before anybody started. A backlog moves the second
+// while leaving the first exactly where it was, so a dashboard with only the
+// duration shows a healthy worker right up until the queue is an hour deep.
+//
+// Optional; a nil Observer is what the integration tests use.
+type Observer interface {
+	ObserveFulfilment(outcome string, elapsed time.Duration)
+	ObserveQueueLatency(waited time.Duration)
+}
+
+// Fulfilment outcomes, as metric labels.
+const (
+	outcomeConfirmed = "confirmed"
+	outcomeDuplicate = "duplicate"
+	outcomePermanent = "permanent_failure"
+	outcomeRetryable = "retryable_failure"
+)
 
 // Service turns a pending purchase into a confirmed one.
 type Service struct {
-	store   Settler
-	delay   time.Duration
-	timeout time.Duration
-	logger  *slog.Logger
+	store    Settler
+	delay    time.Duration
+	timeout  time.Duration
+	observer Observer
+	logger   *slog.Logger
+}
+
+// WithObserver attaches metrics to a Service.
+func (s *Service) WithObserver(o Observer) *Service {
+	s.observer = o
+	return s
 }
 
 // New builds a Service.
@@ -54,6 +83,13 @@ func New(store Settler, delay, timeout time.Duration, logger *slog.Logger) *Serv
 // provides.
 func (s *Service) Fulfil(ctx context.Context, delivery queue.Delivery) error {
 	message := delivery.Message
+	started := time.Now()
+
+	// Measured before any work, because this is how long the ticket waited
+	// for somebody to start rather than how long they then took.
+	if s.observer != nil {
+		s.observer.ObserveQueueLatency(started.Sub(message.IssuedAt))
+	}
 
 	log := s.logger.With(
 		slog.String("purchase_id", message.PurchaseID),
@@ -63,16 +99,18 @@ func (s *Service) Fulfil(ctx context.Context, delivery queue.Delivery) error {
 		slog.Duration("queued_for", time.Since(message.IssuedAt)))
 
 	if err := s.generate(ctx); err != nil {
+		s.observe(outcomeRetryable, started)
 		return err
 	}
 
 	settleCtx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
-	purchase, err := s.store.SettlePurchase(settleCtx, message.PurchaseID, domain.StatusConfirmed)
+	purchase, changed, err := s.store.SettlePurchase(settleCtx, message.PurchaseID, domain.StatusConfirmed)
 
 	switch {
 	case errors.Is(err, domain.ErrPurchaseNotFound):
+		s.observe(outcomePermanent, started)
 		// The message names a purchase the source of truth has never heard
 		// of. No number of retries invents one, and the two waits spent
 		// trying would be two waits nobody spends looking at the real
@@ -80,6 +118,7 @@ func (s *Service) Fulfil(ctx context.Context, delivery queue.Delivery) error {
 		return fmt.Errorf("%w: %w", queue.ErrPermanent, err)
 
 	case errors.Is(err, domain.ErrPurchaseNotPending):
+		s.observe(outcomePermanent, started)
 		// Cancelled or already failed. Something else has decided what
 		// happens to this ticket, and confirming it now would overrule that
 		// decision with a message that predates it.
@@ -88,11 +127,29 @@ func (s *Service) Fulfil(ctx context.Context, delivery queue.Delivery) error {
 	case err != nil:
 		// Everything else is worth another go: a database failing over, a
 		// pool exhausted by a burst, a network that dropped one packet.
+		s.observe(outcomeRetryable, started)
 		return fmt.Errorf("settle purchase: %w", err)
 	}
 
-	log.Info("ticket fulfilled", slog.String("status", string(purchase.Status)))
+	// A redelivery of something already confirmed is a success, and counted
+	// apart from a first confirmation so that a rising duplicate rate is
+	// visible. A few are normal; a lot means acknowledgements are being lost.
+	outcome := outcomeConfirmed
+	if !changed {
+		outcome = outcomeDuplicate
+	}
+	s.observe(outcome, started)
+
+	log.Info("ticket fulfilled",
+		slog.String("status", string(purchase.Status)),
+		slog.Bool("duplicate", !changed))
 	return nil
+}
+
+func (s *Service) observe(outcome string, started time.Time) {
+	if s.observer != nil {
+		s.observer.ObserveFulfilment(outcome, time.Since(started))
+	}
 }
 
 // generate is where a PDF would be drawn.

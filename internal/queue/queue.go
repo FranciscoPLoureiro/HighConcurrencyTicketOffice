@@ -70,6 +70,17 @@ var retryTiers = []struct {
 	{"ticket_retry_30s", "ticket.retry.30s", 30 * time.Second},
 }
 
+// RetryQueues names the waiting rooms, so that something outside this package
+// can watch how deep they are without knowing how many tiers there are or
+// what each one waits for.
+func RetryQueues() []string {
+	names := make([]string, 0, len(retryTiers))
+	for _, tier := range retryTiers {
+		names = append(names, tier.Queue)
+	}
+	return names
+}
+
 // MaxAttempts is how many times a message is delivered to the worker before it
 // is given up on.
 //

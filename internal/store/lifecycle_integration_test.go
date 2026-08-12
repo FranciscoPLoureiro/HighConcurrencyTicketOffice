@@ -146,13 +146,22 @@ func TestSettlingTwiceIsNotAnError(t *testing.T) {
 
 	purchase := sell(t, s, "student-1")
 
-	first, err := s.SettlePurchase(ctx, purchase.ID, domain.StatusConfirmed)
+	first, changed, err := s.SettlePurchase(ctx, purchase.ID, domain.StatusConfirmed)
 	if err != nil {
 		t.Fatalf("first SettlePurchase() = %v", err)
 	}
-	second, err := s.SettlePurchase(ctx, purchase.ID, domain.StatusConfirmed)
+	if !changed {
+		t.Error("the first settle reported no change; it moved the row")
+	}
+
+	second, changed, err := s.SettlePurchase(ctx, purchase.ID, domain.StatusConfirmed)
 	if err != nil {
 		t.Fatalf("second SettlePurchase() = %v, want a duplicate to be accepted", err)
+	}
+	// The flag is what lets the worker count duplicates apart from first
+	// confirmations without comparing two machines' clocks.
+	if changed {
+		t.Error("the second settle claimed to have changed something")
 	}
 
 	if first.Status != domain.StatusConfirmed || second.Status != domain.StatusConfirmed {
@@ -177,7 +186,7 @@ func TestSettlingACancelledPurchaseIsRefused(t *testing.T) {
 		t.Fatalf("CancelPurchase() = %v", err)
 	}
 
-	_, err := s.SettlePurchase(ctx, purchase.ID, domain.StatusConfirmed)
+	_, _, err := s.SettlePurchase(ctx, purchase.ID, domain.StatusConfirmed)
 	if !errors.Is(err, domain.ErrPurchaseNotPending) {
 		t.Errorf("SettlePurchase() on a cancelled row = %v, want %v", err, domain.ErrPurchaseNotPending)
 	}
@@ -187,7 +196,7 @@ func TestSettlingAPurchaseThatDoesNotExistIsRefused(t *testing.T) {
 	s := newTestStore(t)
 	openCampaign(t, s, 10)
 
-	_, err := s.SettlePurchase(context.Background(), uuid.NewString(), domain.StatusConfirmed)
+	_, _, err := s.SettlePurchase(context.Background(), uuid.NewString(), domain.StatusConfirmed)
 	if !errors.Is(err, domain.ErrPurchaseNotFound) {
 		t.Errorf("SettlePurchase() on a missing row = %v, want %v", err, domain.ErrPurchaseNotFound)
 	}

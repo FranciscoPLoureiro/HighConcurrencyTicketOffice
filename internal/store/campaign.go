@@ -252,18 +252,22 @@ func (s *Store) ReadPurchase(ctx context.Context, campaignID, purchaseID string)
 //
 // A purchase already in the requested state is not an error: that is precisely
 // what a duplicate delivery looks like from here, and the caller should go on
-// to acknowledge the message rather than retry forever.
-func (s *Store) SettlePurchase(ctx context.Context, purchaseID string, status domain.Status) (domain.Purchase, error) {
+// to acknowledge the message rather than retry forever. The boolean says which
+// of the two happened, because only this function can know — it is the
+// difference between the UPDATE matching a row and not, and any answer
+// reconstructed afterwards from timestamps would be comparing one machine's
+// clock against another's.
+func (s *Store) SettlePurchase(ctx context.Context, purchaseID string, status domain.Status) (domain.Purchase, bool, error) {
 	purchase, err := scanPurchase(s.pool.QueryRow(ctx, `
 		UPDATE purchases SET status = $2, updated_at = now()
 		WHERE id = $1 AND status = $3
 		RETURNING `+purchaseColumns,
 		purchaseID, status, domain.StatusPending))
 	if err == nil {
-		return purchase, nil
+		return purchase, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return domain.Purchase{}, fmt.Errorf("settle purchase: %w", err)
+		return domain.Purchase{}, false, fmt.Errorf("settle purchase: %w", err)
 	}
 
 	// Nothing was pending. Either this already ran, or the row is in a state
@@ -271,11 +275,11 @@ func (s *Store) SettlePurchase(ctx context.Context, purchaseID string, status do
 	current, err := readPurchaseByID(ctx, s.pool, purchaseID)
 	switch {
 	case err != nil:
-		return domain.Purchase{}, err
+		return domain.Purchase{}, false, err
 	case current.Status == status:
-		return current, nil
+		return current, false, nil
 	default:
-		return domain.Purchase{}, fmt.Errorf("%w: purchase is %s, not %s",
+		return domain.Purchase{}, false, fmt.Errorf("%w: purchase is %s, not %s",
 			domain.ErrPurchaseNotPending, current.Status, domain.StatusPending)
 	}
 }

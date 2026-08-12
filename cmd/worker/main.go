@@ -8,15 +8,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/config"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/correlation"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/fulfilment"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/metrics"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/queue"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
 )
@@ -46,14 +50,49 @@ func run() error {
 		return fmt.Errorf("load configuration: %w", err)
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	// Wrapped exactly as the API wraps it, which is the point: an id minted
+	// for an HTTP request travels in the queue message and comes back out
+	// here, so one search spans both processes.
+	logger := slog.New(correlation.NewHandler(
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})))
 	slog.SetDefault(logger)
+
+	telemetry := metrics.New()
 
 	// Trapped before any dependency is opened, so that a SIGTERM arriving
 	// while the broker is still coming up is honoured rather than ignored
 	// for the ninety seconds the dial is allowed to take.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// A listener that serves nothing but /metrics. The worker answers no
+	// requests and wants no port for its own sake, but a process Prometheus
+	// cannot reach is one whose queue depth, duplicate rate and fulfilment
+	// latency exist only in its own memory.
+	metricsServer := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           metricsRoutes(telemetry),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	go func() {
+		logger.Info("worker metrics listening", slog.String("addr", cfg.MetricsAddr))
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Not fatal, deliberately. A worker that cannot be scraped should
+			// carry on fulfilling tickets: losing the metrics is bad, and
+			// stopping the work because of it is worse.
+			logger.Error("worker metrics listener stopped", slog.Any("error", err))
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("closing the metrics listener", slog.Any("error", err))
+		}
+	}()
 
 	db, err := store.Open(ctx, cfg.PostgresDSN, workerPoolConfig())
 	if err != nil {
@@ -66,13 +105,14 @@ func run() error {
 	// be a second writer racing the first through the same advisory lock for
 	// no benefit, and one that reconciled would be rebuilding Redis from
 	// PostgreSQL while the API is selling from it.
-	work := fulfilment.New(db, cfg.FulfilmentDelay, cfg.PostgresTimeout, logger)
+	work := fulfilment.New(db, cfg.FulfilmentDelay, cfg.PostgresTimeout, logger).
+		WithObserver(telemetry)
 
 	logger.Info("worker starting",
 		slog.Int("prefetch", cfg.WorkerPrefetch),
 		slog.Duration("fulfilment_delay", cfg.FulfilmentDelay))
 
-	if err := serve(ctx, cfg, work.Fulfil, logger); err != nil {
+	if err := serve(ctx, cfg, work.Fulfil, telemetry, logger); err != nil {
 		return err
 	}
 
@@ -100,9 +140,11 @@ func workerPoolConfig() store.PoolConfig {
 // queue, and the tickets it should be fulfilling simply age in place — so
 // Consume reporting a dropped connection is a reason to dial again, and only a
 // cancelled context is a reason to stop.
-func serve(ctx context.Context, cfg config.Config, handler queue.Handler, logger *slog.Logger) error {
+func serve(ctx context.Context, cfg config.Config, handler queue.Handler,
+	telemetry *metrics.Metrics, logger *slog.Logger,
+) error {
 	for {
-		err := consumeOnce(ctx, cfg, handler, logger)
+		err := consumeOnce(ctx, cfg, handler, telemetry, logger)
 
 		// Checked before the error, not after. Shutting down closes the
 		// connection underneath the consumer, so the last thing it reports on
@@ -130,7 +172,9 @@ func serve(ctx context.Context, cfg config.Config, handler queue.Handler, logger
 }
 
 // consumeOnce runs one connection's worth of consuming.
-func consumeOnce(ctx context.Context, cfg config.Config, handler queue.Handler, logger *slog.Logger) error {
+func consumeOnce(ctx context.Context, cfg config.Config, handler queue.Handler,
+	telemetry *metrics.Metrics, logger *slog.Logger,
+) error {
 	broker, err := dialBroker(ctx, cfg.RabbitMQURL, logger)
 	if err != nil {
 		return fmt.Errorf("open rabbitmq: %w", err)
@@ -163,8 +207,63 @@ func consumeOnce(ctx context.Context, cfg config.Config, handler queue.Handler, 
 
 	consumer := queue.NewConsumer(broker, publisher, cfg.WorkerPrefetch, workTimeout, logger)
 
+	// Depth is polled rather than inferred from the messages this worker
+	// happens to see, because the number that matters is the backlog nobody
+	// has started on. It is also the only honest liveness signal a process
+	// serving nothing can offer: a worker wedged on a dependency looks
+	// perfectly alive from outside and shows up here within one tick.
+	depthCtx, stopPolling := context.WithCancel(ctx)
+	defer stopPolling()
+	go pollQueueDepth(depthCtx, broker, telemetry, cfg.QueueDepthInterval, logger)
+
 	logger.Info("worker consuming", slog.String("queue", queue.ProcessingQueue))
 	return consumer.Consume(ctx, handler)
+}
+
+// metricsRoutes exposes the registry and nothing else.
+func metricsRoutes(telemetry *metrics.Metrics) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", telemetry.Handler())
+	return mux
+}
+
+// pollQueueDepth records how deep each queue is, until told to stop.
+//
+// The retry tiers are watched alongside the processing queue on purpose. A
+// backlog on the first means the workers are behind; a backlog on a retry queue
+// means something is failing over and over. Summed into one number those two
+// are indistinguishable, and they call for opposite responses — more workers,
+// or fewer until somebody has looked.
+func pollQueueDepth(ctx context.Context, broker *queue.Connection, telemetry *metrics.Metrics,
+	every time.Duration, logger *slog.Logger,
+) {
+	watched := append([]string{queue.ProcessingQueue, queue.DeadLetterQueue}, queue.RetryQueues()...)
+
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	for {
+		for _, name := range watched {
+			depth, err := broker.QueueDepth(ctx, name)
+			if err != nil {
+				// Expected while a connection is going away, and not worth a
+				// line per queue per tick on the way out.
+				if ctx.Err() == nil {
+					logger.Warn("could not read queue depth",
+						slog.String("queue", name),
+						slog.Any("error", err))
+				}
+				continue
+			}
+			telemetry.SetQueueDepth(name, depth)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // dialBroker connects and declares the topology, retrying while the broker is

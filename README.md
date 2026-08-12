@@ -26,7 +26,7 @@ request.
 | 1 | Naive MVP that demonstrates the race | ✅ done |
 | 2 | Atomic purchase in Redis, stock reconciliation | ✅ done |
 | 3 | Async fulfilment with RabbitMQ, idempotency | ✅ done |
-| 4 | Prometheus, Grafana, calibrated load testing | ⬜ |
+| 4 | Prometheus, Grafana, calibrated load testing | ✅ done |
 | 5 | The lost ticket, compensation saga, failure modes | ⬜ |
 
 The architecture diagram draws the unbuilt parts with dashed lines, so the shape
@@ -59,9 +59,12 @@ can act on the status line without parsing the body. The body still names the
 failing dependency, because that is the difference between an alert someone can
 act on and one they cannot.
 
-`make up` starts two processes. The **api** serves requests and decides who gets
-a ticket; the **worker** generates the tickets it sold. The worker publishes no
-port and answers no health check on purpose — whether it is working is visible
+`make up` starts the API, the worker, their three dependencies, and Prometheus
+and Grafana — the dashboard is on <http://localhost:3000> and needs no login.
+
+The **api** serves requests and decides who gets a ticket; the **worker**
+generates the tickets it sold. The worker publishes no port and answers no
+health check on purpose — whether it is working is visible
 in the depth of `ticket_processing_queue`, which is a better signal than a
 running process, because a worker wedged on a dependency passes any probe it
 could serve about itself. Add more of them independently:
@@ -81,9 +84,12 @@ ended up in the dead letter queue.
 | `make lint` | golangci-lint |
 | `make verify` | Everything CI runs, in the same order |
 | `make integration-test` | Tests against real containers via Testcontainers |
-| `make load-test` | k6 smoke test against a running stack |
-| `make load-test-campaign-internal` | The campaign, generated inside the network |
-| `make reset` | Destroy all state and come back up clean |
+| `make cover` | Coverage across the whole suite, integration included |
+| `make load-test-calibrate` | Measure the generator before believing it |
+| `make load-test-ramp` | The CI profile, with thresholds that fail |
+| `make load-test-campaign-internal` | The midnight burst, inside the network |
+| `make dashboard` | Render the Grafana dashboard to `docs/` |
+| `make reset` | Truncate, flush, purge and reconcile |
 
 Run `make` on its own for the full list. The two `load-test` targets that drive
 the API from the host expect a `k6` binary there; the `-internal` one, which is
@@ -95,7 +101,9 @@ A purchase needs two headers: who is buying, and a key that makes the request
 safe to send twice.
 
 ```bash
-curl -X POST localhost:8080/api/v1/tickets/purchase   -H 'X-User-ID: student-1'   -H "Idempotency-Key: $(uuidgen)"
+curl -X POST localhost:8080/api/v1/tickets/purchase \
+  -H 'X-User-ID: student-1' \
+  -H "Idempotency-Key: $(uuidgen)"
 ```
 
 ```json
@@ -179,6 +187,112 @@ status `0` for a request that never got a response, and the check was
 as the API, which removes the host's port forwarding from the path: 0% failures,
 same hardware. Any number quoted in this README comes from that path.
 
+### The test environment, declared
+
+A load figure without the machine it came from is decoration. This is the
+machine, and these are the limits every service runs under — set in
+`docker-compose.yml` so that the same numbers apply on every run rather than
+depending on what else the laptop was doing.
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 7 5700U — 8 cores, 16 threads |
+| Memory | 16 GB, of which Docker's VM gets 8 GB |
+| OS | Windows 11 Home, Docker Desktop 29.7.2 on the WSL2 backend |
+| Generator | k6 v2.2.0, in a container on the same Docker network |
+
+| Service | CPU limit | Memory limit |
+|---|---|---|
+| api | 2.0 | 512 MB |
+| worker | 1.0 | 256 MB |
+| postgres | 2.0 | 1 GB |
+| redis | 1.0 | 256 MB |
+| rabbitmq | 1.0 | 512 MB |
+
+**Calibration first.** `make load-test-calibrate` ramps k6 against `/health` to
+a thousand virtual users and reports what came back: **1,044 req/s** with a p95
+of 1.1 s and no dropped requests.
+
+That number is worth reading carefully, because it does not mean what the brief
+assumes it will. `/health` checks PostgreSQL, Redis *and* RabbitMQ on every
+call, which makes it more expensive than a sold-out refusal — so 1,044 req/s is
+a ceiling on *that endpoint*, not on the generator. The campaign run below
+sustained **3,366 req/s** through the same generator on the same machine, which
+settles the question the calibration was asked: k6 was nowhere near its limit,
+so the campaign figures are measurements of the API.
+
+**The operating point, and why it is 50.** The load test holds a plateau and
+asserts a p99 under 200 ms on the purchase path. Measured repeatedly:
+
+| Peak VUs | p99, a sale | p99, a refusal | Verdict |
+|---|---|---|---|
+| 50 | **126 ms**, **106 ms** | **75 ms**, **77 ms** | passes, repeatably |
+| 100 | 153 ms, 291 ms, 333 ms | 96 ms, 118 ms, 120 ms | passed once in three |
+| 150 | 451 ms | 167 ms | fails |
+| 300 | 363 ms | 168 ms | fails |
+
+100 is where this gets interesting, and where it would have been tempting to
+stop. The first run there passed at 153 ms, and had the measurement been taken
+once it would be in this README as the operating point. Repeating it produced
+291 ms and 333 ms — the difference being that Prometheus and Grafana were by
+then running on the same laptop, scraping every five seconds.
+
+**The variance is the finding.** A figure that passes on a quiet machine and
+fails on a busy one is not a capacity number, it is a coin toss, and a CI gate
+built on one teaches everybody to re-run the build until it goes green. 50 is
+where the result repeats, so 50 is what is declared and what CI runs.
+
+Two honest consequences. The first is that adding observability cost roughly
+half the headroom on this machine — a real trade, paid in capacity for the
+ability to see anything at all. The second is that a p99 over exactly one
+hundred samples is close to "the slowest sale of the hundred", which is a weak
+statistic however it comes out; the campaign is a hundred tickets, so there is
+no larger sample to be had, and the number should be read with that in mind
+rather than as a percentile in the usual sense.
+
+### The load test turns the per-address rate limit off, on purpose
+
+Every virtual user comes from one container and therefore one address, which is
+exactly the traffic shape the per-address limit exists to stop. Left on, the
+first campaign-scale run produced **250,917 rate-limited responses against 3,900
+genuine sold-out refusals** — the run measured the limiter and almost nothing
+else.
+
+The limiter was working correctly. It was simply pointed at the generator. So
+`make load-test-ramp` sets `RATE_LIMIT_IP=0` for the duration and leaves the
+per-account limit on, which is the one doing the real work here anyway — the
+README has said since phase 2 that the address limit is deliberately loose,
+because the audience is a university behind a handful of NAT addresses.
+
+This is worth stating plainly because it is the kind of change that looks like
+tuning until a threshold goes green. The test for whether it is: the invariant
+thresholds are untouched, and the run still sells exactly one hundred tickets.
+
+### What the dashboard shows
+
+`make up` brings up Prometheus and Grafana with the datasource and dashboard
+provisioned from files — no clicking, and nothing saved in anybody's browser.
+Grafana is on <http://localhost:3000> and opens straight onto this:
+
+![The Grafana dashboard during a campaign](docs/grafana-dashboard.png)
+
+Exported with `make dashboard`, which renders it headlessly rather than
+screenshotting it, so the image above can be regenerated by anybody with one
+command instead of being a picture of a particular afternoon.
+
+Reading it left to right: the purchase p99 sitting at 141 ms under the 200 ms
+line, throughput peaking at 1.1k req/s, exactly 100 tickets sold, no
+compensations, every refusal accounted for as `stock_exhausted`, no 5xx at all,
+the processing queue filling to 93 and draining, and the gap between how long a
+ticket waited and how long fulfilling it took.
+
+That last panel is the one worth pausing on. Fulfilment p95 is 2.48 s — the
+simulated render, near enough exactly — while the queue wait p95 reaches 4.8
+minutes. The work is not slow; the backlog is deep, because one worker at two
+seconds a ticket drains a hundred of them in three and a half minutes. A
+dashboard showing only the duration would report a perfectly healthy worker
+throughout. `--scale worker=3` divides it.
+
 ### The Go toolchain runs in a container
 
 `make test` and friends execute the Go toolchain inside `golang:1.26` rather
@@ -226,6 +340,8 @@ Client ──Idempotency-Key──> [Rate limiter] ──429 + Retry-After──
                   every start
 
   API returns 202 + correlation id; the client polls /status.
+
+  [Prometheus] <-- scrapes the API and every worker; [Grafana] draws it
 ```
 
 A sale makes three writes across three systems, and no two of them are atomic
@@ -846,6 +962,94 @@ anything above that number is connections that exist in order to be idle.
 the machine. A deployment with a different ratio of instances to database would
 have to revisit them, which is the honest state of any pool setting.
 
+### Why the histogram buckets are chosen rather than inherited
+
+**Context.** The load test fails CI when the p99 of a purchase exceeds 200 ms,
+and the Grafana panel draws a line at the same place.
+
+**Decision.** Explicit buckets, with 0.2 as a boundary.
+
+Prometheus interpolates a quantile *within* whichever bucket it falls into. The
+client library's default buckets jump straight from 0.1 to 0.25, so a p99 near
+the threshold would be a straight-line guess across a gap wider than the
+threshold itself — and the number deciding whether the build goes red would be
+an estimate with a ±75 ms shrug in it.
+
+**Consequences.** Fourteen buckets instead of eleven, and three sets of them,
+because the questions are on different scales: HTTP requests in milliseconds,
+fulfilment in seconds around a two-second render, and queue latency spanning
+milliseconds to minutes. Sharing one set would put every fulfilment in the same
+overflow bucket and report nothing at all.
+
+### Why the load test disables the per-address rate limit
+
+**Context.** Every virtual user comes from one container and therefore one
+address — which is exactly the traffic the per-address limit exists to stop.
+
+**Decision.** `make load-test-ramp` sets `RATE_LIMIT_IP=0` and leaves the
+per-account limit on.
+
+The first campaign-scale run with the limit in place produced **250,917
+rate-limited responses against 3,900 genuine sold-out refusals**. It measured
+the rate limiter, and almost nothing else. The limiter was working correctly; it
+was pointed at the generator.
+
+**Consequences.** This is the kind of change that looks like tuning until a
+threshold goes green, so it is worth saying what makes it not that. The
+invariant thresholds are untouched — the run still has to sell exactly one
+hundred tickets, produce no 5xx and answer every request with a documented
+code — and only the load *shaping* changed. The per-account limit, which the
+README has called the one doing the real work since phase 2, stays on
+throughout.
+
+The honest cost: this run no longer exercises the per-address limiter at all.
+It has its own integration test, which is where that behaviour is actually
+checked.
+
+### Why every threshold is paired with a count
+
+**Context.** A k6 threshold over a metric with no samples **passes**.
+
+**Decision.** Every threshold that could be satisfied by an empty metric sits
+next to a counter assertion that cannot be.
+
+This is not hypothetical. An earlier version of the load test tagged requests by
+mutating `res.request.tags` after the response arrived — which throws, because
+k6 fixes a request's tags when it is made. Every iteration aborted before its
+checks ran, no samples were recorded, and the run reported a **clean green sweep
+across every threshold**, including a p99 that had never seen a single request.
+
+**Consequences.** `tickets_sold: count==100` guards the sale latency threshold,
+`refusals: count>1000` guards the refusal one, `http_reqs: count>1000` proves
+the script ran at all, and `undocumented_answers: count==0` is a counter this
+project controls rather than a metric whose semantics k6 might rename — as it
+did with `checks`, where the old name silently watches nothing.
+
+The latency thresholds themselves are on a `Trend` recorded by hand rather than
+on `http_req_duration`, because the outcome of a request is not knowable until
+the response arrives and k6 will not accept a `count` threshold on a trend
+anyway.
+
+### Why coverage is measured in the integration job
+
+**Context.** The reported figure was **31.2%**, and it was measured without
+`-tags=integration`.
+
+**Decision.** Measure it where the tag is on, with `-coverpkg=./...`. The number
+is now **61.0%**.
+
+The old figure was not merely low, it was upside down: `store`, `cache`,
+`purchase`, `queue` and `fulfilment` carry the heaviest tests in the project and
+every one of them reported **zero**, so the packages with the most testing
+looked like the ones with none. `-coverpkg` is the other half — without it,
+coverage credits only the package a test lives in, so the end-to-end suite that
+drives the store and the queue through a real broker would count toward neither.
+
+**Consequences.** Coverage now needs Docker, which is why it lives in the
+integration job rather than in `verify`. There is still no badge, and there will
+not be one until it is worth trusting: 61% is a description of what is covered,
+not a target to raise.
+
 ### Why the standard library instead of a web framework
 
 **Context.** The API has a handful of routes and needs middleware for identity,
@@ -924,10 +1128,27 @@ Kept honest as the project grows.
   asserts that it still oversells — if that ever stops reproducing, the
   comparison is measuring nothing and should fail loudly rather than quietly
   pass.
-- Load figures come from one developer machine with the generator on the same
-  Docker network. They are useful for before-and-after comparison on identical
-  hardware and mean nothing as an absolute capacity claim. Phase 4 declares the
-  environment and resource limits properly.
+- **Load figures come from one laptop, and vary between runs on it.** The
+  environment and its container limits are declared above, which makes the
+  numbers comparable across phases on the same hardware and still meaningless as
+  an absolute capacity claim. The p99 at 100 virtual users moved from 153 ms to
+  333 ms purely because Prometheus and Grafana were running the second time.
+- **A p99 over a hundred samples is barely a percentile.** The campaign is a
+  hundred tickets, so the sale-latency threshold is close to an assertion about
+  the single slowest sale. There is no larger sample to be had without changing
+  the campaign, and the number should be read with that in mind.
+- **CI runs the load test at a lower load than the declared measurement.** A
+  hosted runner is a shared machine with invisible neighbours, so that job
+  exists to catch a regression in the invariant — exactly 100 sold, no 5xx, no
+  undocumented answer — rather than to publish a latency figure.
+- **Coverage is 61%, and the number is a description rather than a target.**
+  The commands, the wiring in `cmd/`, and the metrics package are largely
+  uncovered; the domain logic and every failure path that can be provoked are
+  not. There is no badge, and there will not be one until it says something
+  worth trusting.
+- **The dashboard has no alerting.** It shows the panels an incident would be
+  read from, and nothing pages anybody. That is a deliberate stopping point for
+  a project with no on-call rota, not an oversight.
 
 ## Deploying it
 
