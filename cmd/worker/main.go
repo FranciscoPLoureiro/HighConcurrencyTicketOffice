@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/compensation"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/config"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/correlation"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/fulfilment"
@@ -105,6 +107,15 @@ func run() error {
 	// be a second writer racing the first through the same advisory lock for
 	// no benefit, and one that reconciled would be rebuilding Redis from
 	// PostgreSQL while the API is selling from it.
+	// The worker needs Redis now, which it did not before: reversing a sale
+	// means putting its ticket back on the shelf, and the shelf is in Redis.
+	redis := cache.Open(cfg.RedisAddr, cfg.RedisPassword)
+	defer func() {
+		if err := redis.Close(); err != nil {
+			logger.Warn("closing redis", slog.Any("error", err))
+		}
+	}()
+
 	work := fulfilment.New(db, cfg.FulfilmentDelay, cfg.PostgresTimeout, logger).
 		WithObserver(telemetry)
 
@@ -112,7 +123,7 @@ func run() error {
 		slog.Int("prefetch", cfg.WorkerPrefetch),
 		slog.Duration("fulfilment_delay", cfg.FulfilmentDelay))
 
-	if err := serve(ctx, cfg, work.Fulfil, telemetry, logger); err != nil {
+	if err := serve(ctx, cfg, work.Fulfil, db, redis, telemetry, logger); err != nil {
 		return err
 	}
 
@@ -141,10 +152,10 @@ func workerPoolConfig() store.PoolConfig {
 // Consume reporting a dropped connection is a reason to dial again, and only a
 // cancelled context is a reason to stop.
 func serve(ctx context.Context, cfg config.Config, handler queue.Handler,
-	telemetry *metrics.Metrics, logger *slog.Logger,
+	db *store.Store, redis *cache.Cache, telemetry *metrics.Metrics, logger *slog.Logger,
 ) error {
 	for {
-		err := consumeOnce(ctx, cfg, handler, telemetry, logger)
+		err := consumeOnce(ctx, cfg, handler, db, redis, telemetry, logger)
 
 		// Checked before the error, not after. Shutting down closes the
 		// connection underneath the consumer, so the last thing it reports on
@@ -173,7 +184,7 @@ func serve(ctx context.Context, cfg config.Config, handler queue.Handler,
 
 // consumeOnce runs one connection's worth of consuming.
 func consumeOnce(ctx context.Context, cfg config.Config, handler queue.Handler,
-	telemetry *metrics.Metrics, logger *slog.Logger,
+	db *store.Store, redis *cache.Cache, telemetry *metrics.Metrics, logger *slog.Logger,
 ) error {
 	broker, err := dialBroker(ctx, cfg.RabbitMQURL, logger)
 	if err != nil {
@@ -216,8 +227,36 @@ func consumeOnce(ctx context.Context, cfg config.Config, handler queue.Handler,
 	defer stopPolling()
 	go pollQueueDepth(depthCtx, broker, telemetry, cfg.QueueDepthInterval, logger)
 
-	logger.Info("worker consuming", slog.String("queue", queue.ProcessingQueue))
-	return consumer.Consume(ctx, handler)
+	// The compensation saga drains the dead letter queue alongside the main
+	// consumer. In the same process because it needs the same three
+	// connections and runs approximately never; in its own goroutine because
+	// a worker busy fulfilling tickets must not be the reason a failed sale
+	// keeps its seat.
+	saga := compensation.New(db, redis, publisher, cfg.PostgresTimeout, logger).
+		WithObserver(telemetry)
+
+	compensator := queue.NewConsumer(broker, publisher, 1, workTimeout, logger)
+
+	sagaDone := make(chan struct{})
+	go func() {
+		defer close(sagaDone)
+		// SettleByReturning, not the retry tiers. These messages are already
+		// in the dead letter queue; sending one through the waiting rooms
+		// would dead-letter it back onto the *processing* queue and hand a
+		// message known not to work to the workers all over again.
+		if err := compensator.ConsumeFrom(ctx, queue.DeadLetterQueue,
+			queue.SettleByReturning, saga.Compensate); err != nil && ctx.Err() == nil {
+			logger.Error("compensation consumer stopped", slog.Any("error", err))
+		}
+	}()
+
+	logger.Info("worker consuming",
+		slog.String("queue", queue.ProcessingQueue),
+		slog.String("compensating", queue.DeadLetterQueue))
+
+	err = consumer.Consume(ctx, handler)
+	<-sagaDone
+	return err
 }
 
 // metricsRoutes exposes the registry and nothing else.

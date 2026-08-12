@@ -35,13 +35,26 @@ const (
 
 	// ProcessingQueue holds tickets waiting for their document.
 	ProcessingQueue = "ticket_processing_queue"
-	// DeadLetterQueue holds messages that failed every attempt. Nothing
-	// consumes it: its purpose is to stop and be looked at.
+	// DeadLetterQueue holds messages that failed every attempt.
+	//
+	// Consumed since phase 5 by the compensation saga, which is a change of
+	// role worth noting: until then its purpose was to stop and be looked at.
+	// A dead letter queue that something drains automatically is only safe
+	// because what drains it *undoes* the sale rather than retrying it — the
+	// message is already known not to work, and the ticket is the thing worth
+	// rescuing.
 	DeadLetterQueue = "ticket_dead_letter_queue"
 
+	// CompensationQueue records sales that were reversed. Nothing in this
+	// project consumes it, and that is the point: it is where a notification
+	// service would learn that somebody needs telling their ticket failed,
+	// and it exists now so the saga has somewhere to say so.
+	CompensationQueue = "ticket_compensation_queue"
+
 	// The routing keys.
-	ProcessKey = "ticket.process"
-	DeadKey    = "ticket.dead"
+	ProcessKey      = "ticket.process"
+	DeadKey         = "ticket.dead"
+	CompensationKey = "ticket.compensated"
 )
 
 // retryTiers are the waiting rooms a failed message passes through.
@@ -161,6 +174,7 @@ func (c *Connection) declare(_ context.Context) error {
 	}{
 		{ProcessingQueue, ProcessKey, nil},
 		{DeadLetterQueue, DeadKey, nil},
+		{CompensationQueue, CompensationKey, nil},
 	}
 	for _, tier := range retryTiers {
 		queues = append(queues, struct {

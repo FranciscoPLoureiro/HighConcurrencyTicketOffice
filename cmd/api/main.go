@@ -142,6 +142,25 @@ func withRequestTimeout(budget time.Duration, next http.Handler) http.Handler {
 	})
 }
 
+// killer returns the process-ending half of fault injection, or nil.
+//
+// nil is the default and the more useful demonstration: the sale is abandoned
+// and the process lives, which is what a recovered panic looks like — and it
+// leaves the sweeper running to be watched noticing. FAULT_KILL=true is the
+// harder failure the brief asks for, and it takes the sweeper down with it,
+// since the sweeper runs inside this process. What recovers the ticket then is
+// startup reconciliation.
+func killer(enabled bool, fault purchase.Fault, logger *slog.Logger) func() {
+	if !enabled {
+		return nil
+	}
+	return func() {
+		logger.Error("fault injection: killing the process mid-sale",
+			slog.String("point", string(fault)))
+		os.Exit(1)
+	}
+}
+
 // probeSelf performs the container healthcheck and returns a process exit code.
 func probeSelf() int {
 	cfg, err := config.Load()
@@ -269,11 +288,34 @@ func run() error {
 		}
 	}()
 
+	// Checked here rather than in the config package, which should not import
+	// the packages it configures. Refused at startup either way: a typo in
+	// this variable would silently disarm a demonstration whose whole purpose
+	// is to fail, and somebody would watch a system quietly succeed and
+	// conclude the recovery works.
+	fault, err := purchase.ParseFault(cfg.FaultInjection)
+	if err != nil {
+		return fmt.Errorf("FAULT_INJECTION: %w", err)
+	}
+	if fault != "" {
+		logger.Warn("FAULT INJECTION IS ARMED: sales will be abandoned deliberately",
+			slog.String("point", string(fault)))
+	}
+
 	sales := purchase.New(redis, db, publisher, purchase.Timeouts{
 		Redis:    cfg.RedisTimeout,
 		Postgres: cfg.PostgresTimeout,
 		Publish:  cfg.PublishTimeout,
-	}, logger).WithObserver(telemetry)
+	}, logger).
+		WithObserver(telemetry).
+		WithSweepPolicy(purchase.SweepPolicy{
+			ReservationAge: cfg.ReservationAge,
+			PendingAge:     cfg.PendingAge,
+		}).
+		WithFaults(purchase.Faults{
+			Armed: fault,
+			Kill:  killer(cfg.FaultKill, fault, logger),
+		})
 
 	if err := prepare(ctx, cfg, db, sales, logger); err != nil {
 		return err
@@ -314,6 +356,17 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// The sweeper runs beside the server rather than as its own command. It
+	// needs exactly what the API already holds — Redis, PostgreSQL and a
+	// publisher — and a fourth deployable to run one query a minute would be
+	// three more things to configure and monitor for no benefit. Several API
+	// instances is fine: the pass takes the reconciliation lock.
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		runSweeper(ctx, sales, cfg, logger)
+	}()
+
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("api listening", slog.String("addr", cfg.HTTPAddr))
@@ -338,6 +391,51 @@ func run() error {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
 
+	// The sweeper stops on the same signal, and is waited for so that a pass
+	// in flight finishes rather than being cut off holding the lock.
+	<-sweeperDone
+
 	logger.Info("api stopped cleanly")
 	return nil
+}
+
+// runSweeper looks for interrupted sales until the process is asked to stop.
+func runSweeper(ctx context.Context, sales *purchase.Service, cfg config.Config, logger *slog.Logger) {
+	ticker := time.NewTicker(cfg.SweepInterval)
+	defer ticker.Stop()
+
+	logger.Info("sweeper started",
+		slog.Duration("interval", cfg.SweepInterval),
+		slog.Duration("reservation_age", cfg.ReservationAge),
+		slog.Duration("pending_age", cfg.PendingAge))
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		// Its own budget, detached from nothing: a pass that outlives the
+		// interval would otherwise overlap the next one, and both would fight
+		// over the same lock while holding database connections.
+		passCtx, cancel := context.WithTimeout(ctx, cfg.SweepInterval)
+		result, err := sales.Sweep(passCtx, cfg.CampaignID)
+		cancel()
+
+		if err != nil && ctx.Err() == nil {
+			logger.Error("sweep failed", slog.Any("error", err))
+			continue
+		}
+
+		// Logged only when it did something. A line every fifteen seconds
+		// saying nothing was wrong is how a log stops being read, and this is
+		// a log somebody will be reading precisely when something is.
+		if result.Released > 0 || result.Republished > 0 {
+			logger.Warn("sweeper recovered stuck sales",
+				slog.Int("released", result.Released),
+				slog.Int("republished", result.Republished),
+				slog.Int("closed", result.Closed))
+		}
+	}
 }

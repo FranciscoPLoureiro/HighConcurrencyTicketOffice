@@ -22,7 +22,7 @@ func (c *Cache) Reconcile(ctx context.Context, campaignID string, remaining int,
 	}
 
 	if err := c.reconcile.Run(ctx, c.client,
-		[]string{stockKey(campaignID), buyersKey(campaignID)},
+		[]string{stockKey(campaignID), buyersKey(campaignID), reservationsKey(campaignID)},
 		args...,
 	).Err(); err != nil {
 		return fmt.Errorf("run reconcile script: %w", err)

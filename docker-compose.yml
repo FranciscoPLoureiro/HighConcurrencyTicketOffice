@@ -26,6 +26,18 @@ services:
       # real work here anyway; the address limit is deliberately loose, because
       # the audience is a university behind a handful of NAT addresses.
       RATE_LIMIT_IP: "${RATE_LIMIT_IP:-1000}"
+
+      # Overridable so the lost-ticket demonstration can be run against this
+      # stack without editing anything. See "the lost ticket" in the README:
+      #
+      #   FAULT_INJECTION=after-decrement RESERVATION_AGE=15s SWEEP_INTERVAL=5s       #     docker compose up -d --wait api
+      #
+      # FAULT_INJECTION is empty everywhere else, and an unrecognised value
+      # makes the API refuse to start rather than disarm quietly.
+      FAULT_INJECTION: "${FAULT_INJECTION:-}"
+      FAULT_KILL: "${FAULT_KILL:-false}"
+      RESERVATION_AGE: "${RESERVATION_AGE:-60s}"
+      SWEEP_INTERVAL: "${SWEEP_INTERVAL:-15s}"
     ports:
       - "8080:8080"
     # Explicit limits, because a load test against an unbounded container

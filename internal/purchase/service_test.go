@@ -35,6 +35,12 @@ type stubDecider struct {
 	// of these tests: compensation either ran or it did not.
 	releases   int
 	releaseErr error
+
+	// confirms counts reservations closed, and expired is what the sweeper
+	// will be handed.
+	confirms   int
+	confirmErr error
+	expired    []cache.Reservation
 }
 
 func (d *stubDecider) Purchase(context.Context, string, string) (cache.Outcome, int64, error) {
@@ -56,6 +62,19 @@ func (d *stubDecider) WithLock(ctx context.Context, _ string, _, _ time.Duration
 	return fn(ctx)
 }
 
+func (d *stubDecider) Confirm(context.Context, string, string) (bool, error) {
+	d.confirms++
+	return true, d.confirmErr
+}
+
+func (d *stubDecider) ExpiredReservations(context.Context, string, time.Duration, int64) ([]cache.Reservation, error) {
+	return d.expired, nil
+}
+
+func (d *stubDecider) CountReservations(context.Context, string) (int64, error) {
+	return int64(len(d.expired)), nil
+}
+
 // stubRecorder stands in for PostgreSQL.
 type stubRecorder struct {
 	err error
@@ -64,6 +83,13 @@ type stubRecorder struct {
 	// sale that was undone from one merely reported as failed.
 	cancellations int
 	cancelErr     error
+
+	// What the sweeper is told about the source of truth. liveLookup, when
+	// set, overrides the fixed answer so a test can vary it per call.
+	liveTicket bool
+	liveErr    error
+	liveLookup func() (bool, error)
+	stalled    []domain.Purchase
 }
 
 func (r *stubRecorder) RecordPending(_ context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
@@ -90,6 +116,17 @@ func (r *stubRecorder) CancelPurchase(_ context.Context, purchaseID string) (dom
 
 func (r *stubRecorder) ReadPurchase(_ context.Context, campaignID, purchaseID string) (domain.Purchase, error) {
 	return domain.Purchase{ID: purchaseID, CampaignID: campaignID}, nil
+}
+
+func (r *stubRecorder) HasLiveTicket(context.Context, string, string) (bool, error) {
+	if r.liveLookup != nil {
+		return r.liveLookup()
+	}
+	return r.liveTicket, r.liveErr
+}
+
+func (r *stubRecorder) StalledPurchases(context.Context, string, time.Duration, int) ([]domain.Purchase, error) {
+	return r.stalled, nil
 }
 
 // stubFulfiller stands in for RabbitMQ.

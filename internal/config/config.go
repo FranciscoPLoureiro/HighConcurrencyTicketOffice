@@ -84,6 +84,24 @@ type Config struct {
 	PostgresTimeout time.Duration
 	PublishTimeout  time.Duration
 
+	// SweepInterval is how often the API looks for sales that were
+	// interrupted partway through, and ReservationAge and PendingAge are how
+	// long a thing must have been stuck to count as abandoned.
+	SweepInterval  time.Duration
+	ReservationAge time.Duration
+	PendingAge     time.Duration
+
+	// FaultInjection deliberately abandons a sale at a named point, so that
+	// the recovery can be watched working. Empty in every environment that is
+	// not a demonstration.
+	//
+	// FaultKill decides how: false abandons the sale and leaves the process
+	// running, which is what the sweeper recovers from; true ends the process,
+	// which takes the sweeper with it and leaves the recovery to startup
+	// reconciliation. They demonstrate different halves.
+	FaultInjection string
+	FaultKill      bool
+
 	// MetricsAddr is where the worker serves /metrics. The API serves its
 	// own on HTTPAddr alongside the routes, because it already has a
 	// listener and a second one would be a second thing to expose.
@@ -187,6 +205,20 @@ const (
 	// scrape sees a fresh value, and far above the cost of asking — a
 	// passive queue declare, four times over.
 	defaultQueueDepthInterval = 10 * time.Second
+
+	// Often enough that a ticket stranded by a crash is back on sale while
+	// the campaign is still running, and rare enough that the pass costs
+	// nothing when — as is normal — it finds nothing.
+	defaultSweepInterval = 15 * time.Second
+	// The safety-critical one. A reservation is released on the strength of
+	// PostgreSQL not knowing about it, so this has to exceed the longest a
+	// legitimate request can take by a comfortable margin: releasing one
+	// whose sale is still in flight sells the same seat twice. REQUEST_TIMEOUT
+	// bounds a purchase at ten seconds, so a minute is six times over.
+	defaultReservationAge = time.Minute
+	// Longer than fulfilment takes, or the sweeper starts republishing work
+	// the worker is in the middle of.
+	defaultPendingAge = 2 * time.Minute
 )
 
 // Load reads configuration from the process environment.
@@ -222,6 +254,12 @@ func Load() (Config, error) {
 		RedisTimeout:    durationVar("REDIS_TIMEOUT", defaultRedisTimeout, &errs),
 		PostgresTimeout: durationVar("POSTGRES_TIMEOUT", defaultPostgresTimeout, &errs),
 		PublishTimeout:  durationVar("PUBLISH_TIMEOUT", defaultPublishTimeout, &errs),
+
+		SweepInterval:  durationVar("SWEEP_INTERVAL", defaultSweepInterval, &errs),
+		ReservationAge: durationVar("RESERVATION_AGE", defaultReservationAge, &errs),
+		PendingAge:     durationVar("PENDING_AGE", defaultPendingAge, &errs),
+		FaultInjection: stringVar("FAULT_INJECTION", ""),
+		FaultKill:      boolVar("FAULT_KILL", false, &errs),
 
 		MetricsAddr:        stringVar("METRICS_ADDR", defaultMetricsAddr),
 		QueueDepthInterval: durationVar("QUEUE_DEPTH_INTERVAL", defaultQueueDepthInterval, &errs),
@@ -315,6 +353,25 @@ func (c Config) validate() []error {
 	if c.QueueDepthInterval <= 0 {
 		errs = append(errs, fmt.Errorf("QUEUE_DEPTH_INTERVAL must be positive, got %s", c.QueueDepthInterval))
 	}
+	if c.SweepInterval <= 0 {
+		errs = append(errs, fmt.Errorf("SWEEP_INTERVAL must be positive, got %s", c.SweepInterval))
+	}
+	// The one setting here that can cause an oversell if it is wrong. A
+	// reservation released while its sale is still in flight hands the same
+	// seat to two people, so this must comfortably exceed the request budget
+	// rather than merely exceed it.
+	if c.ReservationAge <= c.RequestTimeout {
+		errs = append(errs, fmt.Errorf(
+			"RESERVATION_AGE (%s) must be longer than REQUEST_TIMEOUT (%s), or a sale still in flight can have its ticket taken back",
+			c.ReservationAge, c.RequestTimeout))
+	}
+	if c.PendingAge <= 0 {
+		errs = append(errs, fmt.Errorf("PENDING_AGE must be positive, got %s", c.PendingAge))
+	}
+	// FAULT_INJECTION is checked in cmd/api rather than here. Validating it
+	// would mean this package importing the one it names points inside, and
+	// configuration should be the layer everything depends on rather than the
+	// other way round. Startup still refuses an unrecognised value.
 
 	return errs
 }
@@ -359,6 +416,20 @@ func levelVar(key string, fallback slog.Level, errs *[]error) slog.Level {
 		return fallback
 	}
 	return level
+}
+
+func boolVar(key string, fallback bool, errs *[]error) bool {
+	raw := stringVar(key, "")
+	if raw == "" {
+		return fallback
+	}
+
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s: %q is not a boolean (want true or false): %w", key, raw, err))
+		return fallback
+	}
+	return v
 }
 
 func intVar(key string, fallback int, errs *[]error) int {

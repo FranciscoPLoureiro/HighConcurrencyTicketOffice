@@ -28,6 +28,13 @@ type Handler func(ctx context.Context, delivery Delivery) error
 // dead letter queue.
 var ErrPermanent = errors.New("failure will not resolve by retrying")
 
+// returnPause is how long a consumer waits after handing a message back.
+//
+// Without it, a dependency that is down turns the dead letter consumer into a
+// hot loop redelivering the same message thousands of times a second against
+// something already struggling.
+const returnPause = 2 * time.Second
+
 // Consumer feeds a handler from the processing queue.
 type Consumer struct {
 	conn        *Connection
@@ -67,6 +74,23 @@ func NewConsumer(conn *Connection, publisher *Publisher, prefetch int, workTimeo
 	}
 }
 
+// Settlement is what happens to a message the handler could not finish.
+type Settlement int
+
+const (
+	// SettleWithRetry sends a failure through the waiting rooms and then to
+	// the dead letter queue. For work that should succeed eventually.
+	SettleWithRetry Settlement = iota
+
+	// SettleByReturning puts a failure back on the queue it came from.
+	//
+	// For a consumer that is already draining the dead letter queue, where
+	// there is nowhere further to send anything: retrying into the tiers
+	// would dead-letter it back onto the *processing* queue, handing a
+	// message already known not to work to the workers all over again.
+	SettleByReturning
+)
+
 // Consume runs the handler over the processing queue until ctx ends or the
 // connection drops.
 //
@@ -74,6 +98,11 @@ func NewConsumer(conn *Connection, publisher *Publisher, prefetch int, workTimeo
 // away, so a caller can tell "we were asked to stop" from "we should reconnect
 // and carry on".
 func (c *Consumer) Consume(ctx context.Context, handler Handler) error {
+	return c.ConsumeFrom(ctx, ProcessingQueue, SettleWithRetry, handler)
+}
+
+// ConsumeFrom runs the handler over one named queue.
+func (c *Consumer) ConsumeFrom(ctx context.Context, queue string, settlement Settlement, handler Handler) error {
 	ch, err := c.conn.conn.Channel()
 	if err != nil {
 		return fmt.Errorf("open consume channel: %w", err)
@@ -84,7 +113,7 @@ func (c *Consumer) Consume(ctx context.Context, handler Handler) error {
 		return fmt.Errorf("set prefetch: %w", err)
 	}
 
-	deliveries, err := ch.Consume(ProcessingQueue,
+	deliveries, err := ch.Consume(queue,
 		"",    // let the broker name this consumer
 		false, // manual acknowledgement: the whole point is that the message
 		//        survives a worker that dies halfway through
@@ -93,7 +122,7 @@ func (c *Consumer) Consume(ctx context.Context, handler Handler) error {
 		false, // wait for the broker to confirm the consumer
 		nil)
 	if err != nil {
-		return fmt.Errorf("consume %q: %w", ProcessingQueue, err)
+		return fmt.Errorf("consume %q: %w", queue, err)
 	}
 
 	closed := ch.NotifyClose(make(chan *amqp.Error, 1))
@@ -121,13 +150,13 @@ func (c *Consumer) Consume(ctx context.Context, handler Handler) error {
 			if !ok {
 				return errors.New("consume channel closed without notice")
 			}
-			c.dispatch(ctx, handler, raw)
+			c.dispatch(ctx, handler, settlement, raw)
 		}
 	}
 }
 
 // dispatch runs one message through the handler and settles it.
-func (c *Consumer) dispatch(ctx context.Context, handler Handler, raw amqp.Delivery) {
+func (c *Consumer) dispatch(ctx context.Context, handler Handler, settlement Settlement, raw amqp.Delivery) {
 	delivery, err := readDelivery(raw)
 	if err != nil {
 		// A message this build cannot parse will not parse any better on the
@@ -157,6 +186,23 @@ func (c *Consumer) dispatch(ctx context.Context, handler Handler, raw amqp.Deliv
 	defer cancel()
 
 	if err := handler(workCtx, delivery); err != nil {
+		if settlement == SettleByReturning {
+			// Back where it came from, and a pause before the next message.
+			// Without one, a dependency that is down turns this into a hot
+			// loop redelivering the same message thousands of times a second
+			// against something already struggling.
+			log.Error("could not settle a message, returning it to its queue",
+				slog.Any("error", err))
+			if nackErr := delivery.raw.Nack(false, true); nackErr != nil {
+				log.Error("could not return the message either", slog.Any("error", nackErr))
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(returnPause):
+			}
+			return
+		}
+
 		c.settleFailure(ctx, log, delivery, err)
 		return
 	}
