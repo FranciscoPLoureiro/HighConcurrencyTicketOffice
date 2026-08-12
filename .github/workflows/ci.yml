@@ -52,10 +52,12 @@ jobs:
         # -race is the entire point of this pipeline for a project about
         # concurrency. -shuffle=on catches tests that only pass because of
         # the order they happen to run in.
-        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -n 1
+        #
+        # No coverage measured here. This job runs without the integration
+        # tag, so the packages carrying the heaviest tests would report zero
+        # and the total would understate the suite by most of it. The honest
+        # number comes from the integration job, which has the tag on.
+        run: go test -race -shuffle=on ./...
 
   integration:
     name: integration tests
@@ -75,7 +77,58 @@ jobs:
       - name: Integration tests
         # The runner provides Docker directly, so Testcontainers needs none
         # of the socket plumbing the local Makefile target sets up.
-        run: go test -race -shuffle=on -tags=integration -timeout 900s ./...
+        #
+        # Coverage is measured here rather than in the verify job, because
+        # this is the only place the integration tag is on. -coverpkg=./... is
+        # the other half: without it, coverage counts only the package a test
+        # lives in, and the end-to-end suite that drives the store and the
+        # queue through a real broker would credit neither.
+        run: |
+          go test -race -shuffle=on -tags=integration -timeout 900s \
+            -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | tail -n 1
+
+  load:
+    name: load test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the stack
+        # The per-address rate limit is off for the run, because every virtual
+        # user comes from one container and therefore one address — which is
+        # exactly the traffic the limit exists to stop. Left on, this job
+        # measures the rate limiter. The per-account limit stays on.
+        env:
+          RATE_LIMIT_IP: "0"
+        run: docker compose up -d --build --wait
+
+      - name: Reset to the state a campaign starts in
+        # Without this a second run sells zero tickets, because the campaign is
+        # already gone, and the job fails in a way indistinguishable from a real
+        # regression.
+        run: COMPOSE="docker compose" sh scripts/reset.sh
+
+      - name: Run the campaign
+        # Fewer virtual users than the declared local measurement. A hosted
+        # runner is a shared machine with neighbours nobody can see, so the
+        # operating point here is deliberately conservative: this job exists to
+        # catch a regression in the invariant, not to publish a latency figure.
+        # The numbers quoted in the README come from the declared environment.
+        run: |
+          docker run --rm --network ticket-office_default \
+            -v "$PWD/loadtest":/loadtest \
+            -e BASE_URL=http://api:8080 -e VUS=50 \
+            grafana/k6:latest run /loadtest/ramp.js
+
+      - name: Show what the services said if it failed
+        if: failure()
+        run: docker compose logs --tail 200 api worker
 
   image:
     name: build container image

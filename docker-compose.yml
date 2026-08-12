@@ -16,6 +16,16 @@ services:
       REDIS_ADDR: redis:6379
       RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
       LOG_LEVEL: info
+      # Overridable from the host, and the load test is the reason. Every
+      # virtual user comes from one container and therefore one address, which
+      # is exactly the traffic shape the per-address limit exists to stop — so
+      # with it on, a campaign-scale run measures the rate limiter and nothing
+      # else. `make load-test-ramp` sets this to 0.
+      #
+      # The per-account limit stays on throughout. That is the one doing the
+      # real work here anyway; the address limit is deliberately loose, because
+      # the audience is a university behind a handful of NAT addresses.
+      RATE_LIMIT_IP: "${RATE_LIMIT_IP:-1000}"
     ports:
       - "8080:8080"
     # Explicit limits, because a load test against an unbounded container
@@ -186,11 +196,20 @@ services:
       # queue by hand while developing phase 3.
       - "15672:15672"
     volumes:
+      # The memory watermark, which has to be a file: RabbitMQ 4 rejects the
+      # equivalent environment variable as deprecated and refuses to start.
+      # See the config for why the value is set at all.
+      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/20-limits.conf:ro
       - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
+      # 15s, not 5. rabbitmq-diagnostics starts an Erlang node to ask the
+      # question, and on the one CPU this container is limited to that takes
+      # about eight seconds — so a five second timeout could never pass, and
+      # the service sat "unhealthy" while answering AMQP perfectly well. The
+      # limit did not break RabbitMQ; it broke the probe.
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
+      interval: 15s
+      timeout: 15s
       # The Erlang VM takes far longer to become useful than the other two.
       # A short start_period here marks the whole stack unhealthy on a cold
       # boot of a machine that is doing nothing wrong.
@@ -237,6 +256,10 @@ services:
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ticket-office.json
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Points Grafana at the renderer above when it is running. Harmless when
+      # it is not: the render endpoint fails, and nothing else uses it.
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
     ports:
       - "3000:3000"
     volumes:
@@ -250,6 +273,22 @@ services:
           memory: 512M
     depends_on:
       - prometheus
+
+  # Headless Chromium, so that the dashboard in the README is exported by a
+  # command rather than cropped out of somebody's browser. Behind a profile
+  # because it is a documentation tool and has no business in the stack a load
+  # test measures — `docker compose --profile tools up -d renderer`, or just
+  # `make dashboard`.
+  renderer:
+    image: grafana/grafana-image-renderer:latest
+    profiles: ["tools"]
+    environment:
+      ENABLE_METRICS: "false"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
 
 volumes:
   postgres-data:
