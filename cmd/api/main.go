@@ -200,6 +200,12 @@ func run() error {
 			UserLimit:    httpapi.Policy{Limit: cfg.RateLimitUser, Window: cfg.RateLimitWindow},
 			IPLimit:      httpapi.Policy{Limit: cfg.RateLimitIP, Window: cfg.RateLimitWindow},
 			RateLimitKey: cache.RateLimitKey,
+			Idempotency:  redis,
+			IdempotencyPolicy: httpapi.IdempotencyPolicy{
+				Lease:     cfg.IdempotencyLease,
+				Retention: cfg.IdempotencyRetention,
+			},
+			IdempotencyKey: cache.IdempotencyKey,
 		}).Routes(),
 		// Every timeout is set explicitly. The zero value for each of
 		// these is "no limit", which leaves a public listener one slow

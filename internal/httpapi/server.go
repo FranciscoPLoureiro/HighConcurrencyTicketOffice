@@ -42,34 +42,55 @@ type Config struct {
 	// RateLimitKey names a caller's bucket. Injected so that the transport
 	// layer does not have to know how the cache namespaces its keys.
 	RateLimitKey func(scope, id string) string
+
+	// Idempotency and its policy are optional in the same way: a nil store
+	// or a zero policy turns the check off, which is what keeps the handler
+	// tests that are not about replay free of one.
+	Idempotency       IdempotencyStore
+	IdempotencyPolicy IdempotencyPolicy
+
+	// IdempotencyKey names a caller's record, for the same reason
+	// RateLimitKey is injected.
+	IdempotencyKey func(campaignID, userID, key string) string
 }
 
 // Server holds the dependencies shared by every handler.
 type Server struct {
-	health       *health.Checker
-	purchaser    Purchaser
-	campaignID   string
-	logger       *slog.Logger
-	limiter      Limiter
-	userLimit    Policy
-	ipLimit      Policy
-	rateLimitKey func(scope, id string) string
+	health            *health.Checker
+	purchaser         Purchaser
+	campaignID        string
+	logger            *slog.Logger
+	limiter           Limiter
+	userLimit         Policy
+	ipLimit           Policy
+	rateLimitKey      func(scope, id string) string
+	idempotency       IdempotencyStore
+	idempotencyPolicy IdempotencyPolicy
+	idempotencyKey    func(campaignID, userID, key string) string
 }
 
 // New builds a Server.
 func New(cfg Config) *Server {
 	s := &Server{
-		health:       cfg.Health,
-		purchaser:    cfg.Purchaser,
-		campaignID:   cfg.CampaignID,
-		logger:       cfg.Logger,
-		limiter:      cfg.Limiter,
-		userLimit:    cfg.UserLimit,
-		ipLimit:      cfg.IPLimit,
-		rateLimitKey: cfg.RateLimitKey,
+		health:            cfg.Health,
+		purchaser:         cfg.Purchaser,
+		campaignID:        cfg.CampaignID,
+		logger:            cfg.Logger,
+		limiter:           cfg.Limiter,
+		userLimit:         cfg.UserLimit,
+		ipLimit:           cfg.IPLimit,
+		rateLimitKey:      cfg.RateLimitKey,
+		idempotency:       cfg.Idempotency,
+		idempotencyPolicy: cfg.IdempotencyPolicy,
+		idempotencyKey:    cfg.IdempotencyKey,
 	}
 	if s.rateLimitKey == nil {
 		s.rateLimitKey = func(scope, id string) string { return scope + ":" + id }
+	}
+	if s.idempotencyKey == nil {
+		s.idempotencyKey = func(campaignID, userID, key string) string {
+			return campaignID + ":" + userID + ":" + key
+		}
 	}
 	return s
 }
@@ -87,8 +108,14 @@ func (s *Server) Routes() http.Handler {
 	// so the middleware wraps the one route rather than the whole mux. The
 	// rate limit sits inside the identity check, which is what lets it key
 	// on the caller as well as on the address — see withRateLimit.
+	//
+	// Idempotency sits inside the rate limit rather than outside it. A retry
+	// storm should still be throttled, and the per-user budget is generous
+	// enough that an honest client repeating a timed-out request is nowhere
+	// near it. The other order would make a claimed key the cheapest way to
+	// bypass the limiter.
 	mux.Handle("POST /api/v1/tickets/purchase",
-		withIdentity(s.withRateLimit(http.HandlerFunc(s.handlePurchase))))
+		withIdentity(s.withRateLimit(s.withIdempotency(http.HandlerFunc(s.handlePurchase)))))
 
 	return mux
 }

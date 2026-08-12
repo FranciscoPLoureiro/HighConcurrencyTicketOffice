@@ -18,6 +18,21 @@ import http from 'k6/http';
 import { check } from 'k6';
 import { Counter } from 'k6/metrics';
 
+// k6 has no crypto.randomUUID, and pulling a library in from jslib.k6.io would
+// make the load test need network access to a third party to start. Sixteen
+// random bytes formatted as a v4 UUID is what the endpoint validates against.
+function uuid() {
+  const hex = '0123456789abcdef';
+  let out = '';
+  for (let i = 0; i < 36; i++) {
+    if (i === 8 || i === 13 || i === 18 || i === 23) out += '-';
+    else if (i === 14) out += '4';
+    else if (i === 19) out += hex[(Math.random() * 4) | 8];
+    else out += hex[(Math.random() * 16) | 0];
+  }
+  return out;
+}
+
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 const VUS = Number(__ENV.VUS || 100);
 
@@ -68,8 +83,15 @@ export const options = {
 export default function () {
   // Distinct identity per virtual user, so a duplicate refusal is a real
   // signal and not an artefact of the load test reusing one account.
+  //
+  // A fresh idempotency key per attempt, for the same reason. The endpoint
+  // requires one, and reusing a key across virtual users would make most of
+  // this run a replay of one purchase rather than a contest for a hundred.
   const res = http.post(`${BASE_URL}/api/v1/tickets/purchase`, null, {
-    headers: { 'X-User-ID': `student-${__VU}` },
+    headers: {
+      'X-User-ID': `student-${__VU}`,
+      'Idempotency-Key': uuid(),
+    },
   });
 
   if (res.status === 200) {

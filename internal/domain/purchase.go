@@ -50,6 +50,27 @@ const (
 // added to the list stops counting as a ticket and gets sold to someone else.
 func (s Status) Live() bool { return s != StatusCancelled }
 
+// Claim is what became of a client's idempotency key.
+//
+// It lives here rather than in the package that stores the keys, because both
+// the transport layer that acts on it and the cache that decides it need to
+// name the same three answers, and neither should have to import the other to
+// do so.
+type Claim int64
+
+const (
+	// ClaimAccepted means this caller now owns the key and should go on to
+	// do the work.
+	ClaimAccepted Claim = 0
+	// ClaimInFlight means an earlier attempt with the same key is still
+	// running. There is no answer to give yet, and doing the work again to
+	// invent one is the duplicate the key exists to prevent.
+	ClaimInFlight Claim = 1
+	// ClaimReplayed means the work already finished and its response was
+	// kept, so the original answer can be handed back unchanged.
+	ClaimReplayed Claim = 2
+)
+
 // Purchase is one person's claim on one ticket.
 type Purchase struct {
 	ID         string

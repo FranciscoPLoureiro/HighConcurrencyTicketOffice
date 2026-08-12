@@ -48,6 +48,12 @@ type Config struct {
 	RateLimitUser   int
 	RateLimitIP     int
 
+	// IdempotencyLease is how long an unfinished request holds its key
+	// against a retry, and IdempotencyRetention is how long the answer it
+	// produced stays replayable.
+	IdempotencyLease     time.Duration
+	IdempotencyRetention time.Duration
+
 	// LogLevel is the minimum level emitted by the structured logger.
 	LogLevel slog.Level
 }
@@ -92,6 +98,18 @@ const (
 	// working, and the k6 output counts the two refusal reasons separately
 	// so the difference is visible rather than mysterious.
 	defaultRateLimitIP = 1000
+
+	// A lease has to outlast the request it is protecting, or a retry
+	// arriving while the first attempt is still working claims a key that
+	// was never free and buys a second ticket. Thirty seconds is twice the
+	// server's own write timeout, so a request that is still running has
+	// already been abandoned by the HTTP layer.
+	defaultIdempotencyLease = 30 * time.Second
+	// Retention answers a different question: how long after giving up might
+	// somebody try again? A day covers a client that retried after a crash,
+	// a phone that regained signal, or a person who reopened the tab in the
+	// morning, and costs a few hundred bytes per purchase to do it.
+	defaultIdempotencyRetention = 24 * time.Hour
 )
 
 // Load reads configuration from the process environment.
@@ -114,6 +132,9 @@ func Load() (Config, error) {
 		RateLimitWindow: durationVar("RATE_LIMIT_WINDOW", defaultRateLimitWindow, &errs),
 		RateLimitUser:   intVar("RATE_LIMIT_USER", defaultRateLimitUser, &errs),
 		RateLimitIP:     intVar("RATE_LIMIT_IP", defaultRateLimitIP, &errs),
+
+		IdempotencyLease:     durationVar("IDEMPOTENCY_LEASE", defaultIdempotencyLease, &errs),
+		IdempotencyRetention: durationVar("IDEMPOTENCY_RETENTION", defaultIdempotencyRetention, &errs),
 	}
 
 	errs = append(errs, cfg.validate()...)
@@ -158,6 +179,16 @@ func (c Config) validate() []error {
 	}
 	if c.RateLimitWindow <= 0 {
 		errs = append(errs, fmt.Errorf("RATE_LIMIT_WINDOW must be positive, got %s", c.RateLimitWindow))
+	}
+	// Neither of these may be switched off. A zero lease claims a key that
+	// expires before the request it protects finishes, and a zero retention
+	// keeps no answer to replay — in both cases the endpoint silently stops
+	// being idempotent while still demanding the header that says it is.
+	if c.IdempotencyLease <= 0 {
+		errs = append(errs, fmt.Errorf("IDEMPOTENCY_LEASE must be positive, got %s", c.IdempotencyLease))
+	}
+	if c.IdempotencyRetention <= 0 {
+		errs = append(errs, fmt.Errorf("IDEMPOTENCY_RETENTION must be positive, got %s", c.IdempotencyRetention))
 	}
 
 	return errs

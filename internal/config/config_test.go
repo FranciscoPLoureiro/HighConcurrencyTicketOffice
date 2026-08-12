@@ -42,6 +42,8 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("RATE_LIMIT_WINDOW", "30s")
 	t.Setenv("RATE_LIMIT_USER", "3")
 	t.Setenv("RATE_LIMIT_IP", "400")
+	t.Setenv("IDEMPOTENCY_LEASE", "20s")
+	t.Setenv("IDEMPOTENCY_RETENTION", "6h")
 
 	cfg, err := Load()
 	if err != nil {
@@ -63,6 +65,9 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 		RateLimitWindow: 30 * time.Second,
 		RateLimitUser:   3,
 		RateLimitIP:     400,
+
+		IdempotencyLease:     20 * time.Second,
+		IdempotencyRetention: 6 * time.Hour,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v, want %+v", cfg, want)

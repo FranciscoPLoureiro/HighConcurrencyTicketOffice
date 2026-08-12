@@ -8,16 +8,6 @@ import (
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
 )
 
-// idempotencyKeyHeader carries the client's own identifier for the request.
-//
-// The client generates it, not the server, and that is the whole point. A
-// server-generated key is a different key on every attempt, so it protects
-// against a broker redelivering a message and against nothing else. The failure
-// worth protecting against is the one the client can see: a request that timed
-// out with no answer, where the only safe thing the client can do is send it
-// again — and the only safe thing the server can do is recognise it.
-const idempotencyKeyHeader = "Idempotency-Key"
-
 // purchaseResponse is what a successful purchase returns.
 type purchaseResponse struct {
 	PurchaseID string    `json:"purchase_id"`
