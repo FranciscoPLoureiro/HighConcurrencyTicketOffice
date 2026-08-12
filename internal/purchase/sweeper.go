@@ -214,6 +214,15 @@ func (s *Service) settleReservation(ctx context.Context, campaignID string, rese
 // purchase moves a row only if it is still pending, so a duplicate finds
 // nothing to do. That property was built for the broker's at-least-once
 // delivery and this reuses it rather than inventing a second mechanism.
+//
+// Safe is not the same as free, which is why each republish is recorded. The
+// query finds purchases that have sat unchanged for PendingAge, and sending a
+// message does not change the row: unrecorded, every pass re-sends every stalled
+// purchase, so a worker that is down for three minutes comes back to several
+// times its real backlog and spends two seconds of pretend fulfilment on each
+// duplicate before discovering there is nothing to do. The queue depth is this
+// worker's only health signal, and it would go on describing an outage that had
+// already been dealt with.
 func (s *Service) republishStalled(ctx context.Context, campaignID string) (int, error) {
 	stalled, err := s.store.StalledPurchases(ctx, campaignID, s.sweep.PendingAge, int(s.sweep.Batch))
 	if err != nil {
@@ -240,6 +249,17 @@ func (s *Service) republishStalled(ctx context.Context, campaignID string) (int,
 			slog.String("campaign_id", campaignID),
 			slog.String("purchase_id", purchase.ID),
 			slog.String("user_id", purchase.UserID))
+
+		// Recorded after the publish, not before. A message the broker
+		// refused has not been sent, and marking it first would hold the
+		// purchase back for another PendingAge over an attempt that never
+		// happened. This way round the failure is a repeat, which the worker
+		// already absorbs.
+		if err := s.store.MarkRepublished(ctx, purchase.ID); err != nil {
+			s.logger.Warn("republished but could not record it, so the next pass will send it again",
+				slog.String("purchase_id", purchase.ID),
+				slog.Any("error", err))
+		}
 
 		// The reservation, if one is still open, is now answered.
 		if _, err := s.cache.Confirm(ctx, campaignID, purchase.UserID); err != nil {

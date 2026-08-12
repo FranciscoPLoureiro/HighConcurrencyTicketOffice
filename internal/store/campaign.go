@@ -443,3 +443,28 @@ func (s *Store) StalledPurchases(ctx context.Context, campaignID string, olderTh
 
 	return stalled, nil
 }
+
+// MarkRepublished records that a stalled purchase has just been sent for
+// fulfilment again.
+//
+// Without it the sweeper re-sends the same purchase on every pass. The query
+// above selects on how long the row has sat unchanged, and republishing does
+// not change the row — so a purchase that crosses PendingAge is republished
+// every SweepInterval for as long as it stays pending, which is precisely the
+// "republishing work the worker is in the middle of" that PendingAge is
+// supposed to rule out. Touching the timestamp turns that into one attempt per
+// PendingAge, which is the interval the setting already claims to be.
+//
+// Guarded on the status, so a worker confirming the purchase at the same
+// moment is not overwritten by a bookkeeping write about a message it has
+// already dealt with.
+func (s *Store) MarkRepublished(ctx context.Context, purchaseID string) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE purchases SET updated_at = now()
+		WHERE id = $1 AND status = $2`,
+		purchaseID, domain.StatusPending,
+	); err != nil {
+		return fmt.Errorf("mark purchase %q republished: %w", purchaseID, err)
+	}
+	return nil
+}

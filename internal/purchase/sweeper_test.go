@@ -152,6 +152,61 @@ func TestAStalledPurchaseIsRepublished(t *testing.T) {
 	}
 }
 
+// One republish per PendingAge, not one per pass.
+//
+// Sending the message does not change the row, so nothing about the purchase
+// tells the next pass it has already been dealt with. Left that way the
+// sweeper re-sends every stalled purchase every SweepInterval — four times a
+// minute with the defaults — and a worker returning from an outage works
+// through several times its real backlog, spending a full pretend fulfilment
+// on each duplicate before finding there is nothing to do.
+func TestAStalledPurchaseIsNotRepublishedOnEveryPass(t *testing.T) {
+	decider := &stubDecider{}
+	recorder := &stubRecorder{stalled: []domain.Purchase{
+		{ID: "purchase-1", CampaignID: "queima", UserID: "student-1", Status: domain.StatusPending},
+	}}
+	fulfiller := &stubFulfiller{}
+	service := newTestServiceWith(decider, recorder, fulfiller)
+
+	for pass := 1; pass <= 3; pass++ {
+		if _, err := service.Sweep(context.Background(), "queima"); err != nil {
+			t.Fatalf("Sweep() pass %d = %v", pass, err)
+		}
+	}
+
+	if len(fulfiller.sent) != 1 {
+		t.Errorf("sent %d messages over three passes for one stalled purchase, want 1",
+			len(fulfiller.sent))
+	}
+}
+
+// A republish the broker refused must not be recorded as one, or the purchase
+// is held back for another PendingAge over an attempt that never happened.
+func TestARefusedRepublishIsNotRecordedAsOne(t *testing.T) {
+	decider := &stubDecider{}
+	recorder := &stubRecorder{stalled: []domain.Purchase{
+		{ID: "purchase-1", CampaignID: "queima", UserID: "student-1", Status: domain.StatusPending},
+	}}
+	fulfiller := &stubFulfiller{err: errors.New("broker unreachable")}
+	service := newTestServiceWith(decider, recorder, fulfiller)
+
+	if _, err := service.Sweep(context.Background(), "queima"); err != nil {
+		t.Fatalf("Sweep() = %v", err)
+	}
+	if recorder.republished["purchase-1"] {
+		t.Fatal("a publish that failed was recorded as a republish")
+	}
+
+	fulfiller.err = nil
+	result, err := service.Sweep(context.Background(), "queima")
+	if err != nil {
+		t.Fatalf("second Sweep() = %v", err)
+	}
+	if result.Republished != 1 {
+		t.Errorf("republished %d once the broker recovered, want 1", result.Republished)
+	}
+}
+
 // A broker that will not take the message leaves the purchase alone. It is
 // still pending, still stalled, and still there for the next pass.
 func TestARepublishThatFailsLeavesThePurchaseForNextTime(t *testing.T) {
