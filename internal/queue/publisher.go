@@ -116,6 +116,16 @@ func (p *Publisher) Retry(ctx context.Context, message TicketMessage, nextAttemp
 	return p.publish(ctx, retryTiers[tier].RoutingKey, message, nextAttempt)
 }
 
+// Compensate records that a sale was reversed, for whatever wants to know.
+//
+// Published after the reversal rather than before it. If this fails the ticket
+// is still back on the shelf and the row is still cancelled, which is the part
+// that matters; a lost notification is worth a log line and not worth undoing
+// a correct compensation over.
+func (p *Publisher) Compensate(ctx context.Context, message TicketMessage) error {
+	return p.publish(ctx, CompensationKey, message, MaxAttempts)
+}
+
 // DeadLetter parks a message that has failed every attempt.
 func (p *Publisher) DeadLetter(ctx context.Context, message TicketMessage, attempt int) error {
 	return p.publish(ctx, DeadKey, message, attempt)
