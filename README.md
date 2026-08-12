@@ -866,6 +866,42 @@ Kept honest as the project grows.
   hardware and mean nothing as an absolute capacity claim. Phase 4 declares the
   environment and resource limits properly.
 
+## Deploying it
+
+`fly.toml` and `.github/workflows/deploy.yml` are written and unapplied. Nothing
+has been deployed, no account exists, and no credential is in this repository —
+the deploy workflow checks for its token first and skips with an explanation
+rather than failing red, so an unconfigured deploy does not teach anyone to
+ignore the badge.
+
+Making it live needs an account and therefore a person:
+
+```bash
+fly launch --no-deploy          # claims the app name in fly.toml
+fly secrets set POSTGRES_DSN=… REDIS_ADDR=… REDIS_PASSWORD=… RABBITMQ_URL=…
+fly deploy
+```
+
+Then add `FLY_API_TOKEN` (from `fly tokens create deploy`) as a GitHub Actions
+secret, and every push to `main` that passes CI deploys itself.
+
+The four secrets are all required — the API migrates the schema and reconciles
+the stock before it listens, so an instance without a database does not start
+rather than starting empty and selling nothing. Managed free tiers cover all
+three dependencies; check the current plans before choosing, since they change
+and some have gone.
+
+The worker is a second Fly app from `docker/worker.Dockerfile` with the same
+secrets and no HTTP service. It is deliberately not described in `fly.toml`,
+which can only name one app, and naming the second one is a choice for whoever
+owns the account.
+
+A public URL is a phase 0 deliverable and it is the last one outstanding. Its
+purpose is to show the pipeline working end to end and to give a reader
+something to click — not to be a load target. Every number in this README comes
+from a developer machine with the generator inside the Docker network, and a
+shared-cpu-1x instance is not expected to reproduce any of them.
+
 ## Roadmap
 
 Beyond the phases above: real authentication, infrastructure as code rather than

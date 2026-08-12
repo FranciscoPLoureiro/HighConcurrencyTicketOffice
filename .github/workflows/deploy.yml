@@ -1,0 +1,90 @@
+name: Deploy
+
+# Deploys the API to Fly.io after CI passes on main.
+#
+# Dormant until somebody adds the FLY_API_TOKEN secret. Until then every run
+# stops at the first step with an explanation rather than failing with a
+# credentials error that reads like a bug — a red X on main for a deploy nobody
+# has set up yet is noise that teaches people to ignore the badge.
+#
+# No account was created and no credential is stored in this repository. What
+# it takes to make this live is in the README under "Deploying it".
+
+on:
+  workflow_run:
+    # Deploying on `push` would race CI: the image would ship whether or not
+    # the tests passed, which is the one thing a pipeline exists to prevent.
+    # This waits for the CI run on the same commit and checks its verdict.
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  # So a deploy can be repeated by hand without an empty commit — the usual
+  # reason being a secret that has just been set for the first time.
+  workflow_dispatch:
+
+# Least privilege. The deploy needs to read the repository and nothing else.
+permissions:
+  contents: read
+
+# One deploy at a time, and never cancel one halfway: a cancelled release can
+# leave machines on two different versions.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: fly deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The workflow_run trigger fires whatever CI concluded, including failure.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Check the deploy is configured
+        id: configured
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          if [ -z "$FLY_API_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Deploy skipped"
+              echo
+              echo "No \`FLY_API_TOKEN\` secret is set, so there is nothing to deploy to."
+              echo "See **Deploying it** in the README for the three commands that set this up."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.configured.outputs.configured == 'true'
+        with:
+          # workflow_run starts from the default branch, not from the commit
+          # that triggered CI. Without this the deploy could ship a different
+          # commit from the one that was tested.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+        if: steps.configured.outputs.configured == 'true'
+
+      - name: Deploy
+        if: steps.configured.outputs.configured == 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        # --strategy rolling keeps an instance serving throughout. The app
+        # tolerates it: startup reconciliation takes a distributed lock, so two
+        # instances booting together rebuild the stock one at a time rather
+        # than racing, and the one still serving is not disturbed.
+        run: flyctl deploy --remote-only --strategy rolling
+
+      - name: Report where it went
+        if: steps.configured.outputs.configured == 'true'
+        run: |
+          {
+            echo "### Deployed"
+            echo
+            echo "<https://high-concurrency-ticket-office.fly.dev/health>"
+          } >> "$GITHUB_STEP_SUMMARY"
