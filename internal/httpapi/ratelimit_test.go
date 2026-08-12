@@ -92,8 +92,8 @@ func TestAnAllowedRequestReachesTheHandler(t *testing.T) {
 
 	rec := postPurchase(t, limitedRoutesFor(stub, limiter, everyRequest, Policy{}), "student-1")
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
 	}
 	if len(stub.calls) != 1 {
 		t.Errorf("purchaser called %d times, want 1", len(stub.calls))
@@ -138,8 +138,9 @@ func TestTheLimiterFailsOpenWhenRedisIsUnreachable(t *testing.T) {
 
 	rec := postPurchase(t, limitedRoutesFor(stub, limiter, everyRequest, Policy{}), "student-1")
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d: the limiter must not reject on its own failure", rec.Code, http.StatusOK)
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want %d: the limiter must not reject on its own failure",
+			rec.Code, http.StatusAccepted)
 	}
 	if len(stub.calls) != 1 {
 		t.Errorf("purchaser called %d times, want 1", len(stub.calls))

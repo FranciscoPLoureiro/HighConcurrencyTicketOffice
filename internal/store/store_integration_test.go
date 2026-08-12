@@ -52,7 +52,7 @@ func newTestStore(t *testing.T) *Store {
 		t.Fatalf("building connection string: %v", err)
 	}
 
-	store, err := Open(ctx, dsn)
+	store, err := Open(ctx, dsn, DefaultPoolConfig)
 	if err != nil {
 		t.Fatalf("opening store: %v", err)
 	}

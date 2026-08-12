@@ -42,6 +42,16 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 	t.Setenv("RATE_LIMIT_WINDOW", "30s")
 	t.Setenv("RATE_LIMIT_USER", "3")
 	t.Setenv("RATE_LIMIT_IP", "400")
+	t.Setenv("IDEMPOTENCY_LEASE", "20s")
+	t.Setenv("IDEMPOTENCY_RETENTION", "6h")
+	t.Setenv("RABBITMQ_URL", "amqp://elsewhere:5672/")
+	t.Setenv("PUBLISHER_CHANNELS", "12")
+	t.Setenv("WORKER_PREFETCH", "6")
+	t.Setenv("FULFILMENT_DELAY", "250ms")
+	t.Setenv("REQUEST_TIMEOUT", "8s")
+	t.Setenv("REDIS_TIMEOUT", "1s")
+	t.Setenv("POSTGRES_TIMEOUT", "3s")
+	t.Setenv("PUBLISH_TIMEOUT", "4s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -63,6 +73,19 @@ func TestLoadReadsEveryValueFromTheEnvironment(t *testing.T) {
 		RateLimitWindow: 30 * time.Second,
 		RateLimitUser:   3,
 		RateLimitIP:     400,
+
+		IdempotencyLease:     20 * time.Second,
+		IdempotencyRetention: 6 * time.Hour,
+
+		RabbitMQURL:       "amqp://elsewhere:5672/",
+		PublisherChannels: 12,
+		WorkerPrefetch:    6,
+		FulfilmentDelay:   250 * time.Millisecond,
+
+		RequestTimeout:  8 * time.Second,
+		RedisTimeout:    time.Second,
+		PostgresTimeout: 3 * time.Second,
+		PublishTimeout:  4 * time.Second,
 	}
 	if cfg != want {
 		t.Errorf("Load() = %+v, want %+v", cfg, want)
@@ -210,6 +233,16 @@ func clearEnv(t *testing.T) {
 		"RATE_LIMIT_WINDOW",
 		"RATE_LIMIT_USER",
 		"RATE_LIMIT_IP",
+		"IDEMPOTENCY_LEASE",
+		"IDEMPOTENCY_RETENTION",
+		"RABBITMQ_URL",
+		"PUBLISHER_CHANNELS",
+		"WORKER_PREFETCH",
+		"FULFILMENT_DELAY",
+		"REQUEST_TIMEOUT",
+		"REDIS_TIMEOUT",
+		"POSTGRES_TIMEOUT",
+		"PUBLISH_TIMEOUT",
 	} {
 		t.Setenv(key, "")
 	}

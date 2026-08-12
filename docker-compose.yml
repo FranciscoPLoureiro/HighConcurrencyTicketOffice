@@ -14,6 +14,7 @@ services:
       HTTP_ADDR: ":8080"
       POSTGRES_DSN: postgres://tickets:tickets@postgres:5432/tickets?sslmode=disable
       REDIS_ADDR: redis:6379
+      RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
       LOG_LEVEL: info
     ports:
       - "8080:8080"
@@ -35,6 +36,34 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+
+  # The worker is scaled independently of the API, which is the point of it
+  # being a separate process: `docker compose up -d --scale worker=3` adds
+  # fulfilment capacity without touching the thing serving requests.
+  #
+  # No published port and no healthcheck. It serves nothing, and whether it is
+  # working is visible in the depth of ticket_processing_queue rather than in
+  # anything it could answer about itself.
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      POSTGRES_DSN: postgres://tickets:tickets@postgres:5432/tickets?sslmode=disable
+      REDIS_ADDR: redis:6379
+      RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      # The API owns the schema, so the worker must not start querying tables
+      # that do not exist yet. Waiting for the API to be healthy is waiting for
+      # the migrations to have run.
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
   postgres:
     image: postgres:18-alpine

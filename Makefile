@@ -116,6 +116,13 @@ cover: ## Run the tests and print total coverage
 	$(GO) test -race -covermode=atomic -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -n 1
 
+.PHONY: vet
+vet: ## Type-check everything, including the integration tests
+	# `go build` skips test files, so a broken integration test compiles
+	# happily until CI runs the one job that touches it. This is the cheap
+	# check that every commit really does build.
+	$(GO) vet -tags=integration ./...
+
 .PHONY: lint
 lint: ## Run golangci-lint
 	$(LINT) run
@@ -129,7 +136,7 @@ tidy: ## Tidy go.mod and go.sum
 	$(GO) mod tidy
 
 .PHONY: verify
-verify: fmt tidy build lint test ## Everything CI runs, in the same order
+verify: fmt tidy build vet lint test ## Everything CI runs, in the same order
 
 ## --- load testing ----------------------------------------------------------
 

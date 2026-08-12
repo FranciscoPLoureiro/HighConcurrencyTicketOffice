@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/correlation"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/domain"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/health"
 )
@@ -21,14 +22,21 @@ const testCampaign = "queima-2026"
 type stubPurchaser struct {
 	purchase domain.Purchase
 	err      error
+	readErr  error
 	// calls records what the handler passed down, which is how the test
 	// catches a handler that sells the wrong campaign or loses the user.
-	calls []struct{ campaignID, userID string }
+	calls []purchaseCall
 }
 
-func (s *stubPurchaser) Purchase(_ context.Context, campaignID, userID string) (domain.Purchase, error) {
-	s.calls = append(s.calls, struct{ campaignID, userID string }{campaignID, userID})
+type purchaseCall struct{ campaignID, userID, idempotencyKey string }
+
+func (s *stubPurchaser) Purchase(_ context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
+	s.calls = append(s.calls, purchaseCall{campaignID, userID, idempotencyKey})
 	return s.purchase, s.err
+}
+
+func (s *stubPurchaser) ReadPurchase(_ context.Context, _, _ string) (domain.Purchase, error) {
+	return s.purchase, s.readErr
 }
 
 func purchaseRoutes(p Purchaser) http.Handler {
@@ -53,6 +61,15 @@ func postPurchase(t *testing.T, handler http.Handler, userID string) *httptest.R
 	return rec
 }
 
+func getStatus(handler http.Handler, userID, purchaseID string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tickets/"+purchaseID+"/status", nil)
+	req.Header.Set(userIDHeader, userID)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
 // decodeErrorCode pulls the machine-readable code out of a failure body. The
 // code is the contract; the prose alongside it is not.
 func decodeErrorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
@@ -65,7 +82,73 @@ func decodeErrorCode(t *testing.T, rec *httptest.ResponseRecorder) string {
 	return body.Error.Code
 }
 
-func TestASuccessfulPurchaseReturnsTheTicket(t *testing.T) {
+// A sale is answered with 202, not 200.
+//
+// The decision is made and durably recorded; the document is not, and will not
+// be for another two seconds. 200 would promise a ticket that does not exist
+// yet, which is exactly the confusion asynchronous fulfilment introduces and
+// the status code is there to prevent.
+func TestASuccessfulPurchaseIsAcceptedRatherThanCompleted(t *testing.T) {
+	stub := &stubPurchaser{purchase: domain.Purchase{
+		ID:         "b0a1c2d3-0000-4000-8000-000000000000",
+		CampaignID: testCampaign,
+		UserID:     "student-1",
+		Status:     domain.StatusPending,
+	}}
+
+	rec := postPurchase(t, purchaseRoutes(stub), "student-1")
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusAccepted, rec.Body)
+	}
+
+	var body acceptedResponse
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding body: %v", err)
+	}
+	if body.PurchaseID != stub.purchase.ID {
+		t.Errorf("purchase_id = %q, want %q", body.PurchaseID, stub.purchase.ID)
+	}
+	if body.Status != string(domain.StatusPending) {
+		t.Errorf("status = %q, want %q", body.Status, domain.StatusPending)
+	}
+
+	// The caller is told where to watch, in the body and in the header, and
+	// the two have to agree — a Location pointing somewhere the JSON does not
+	// is a client bug waiting to be written.
+	want := "/api/v1/tickets/" + stub.purchase.ID + "/status"
+	if body.StatusURL != want {
+		t.Errorf("status_url = %q, want %q", body.StatusURL, want)
+	}
+	if got := rec.Header().Get("Location"); got != want {
+		t.Errorf("Location = %q, want %q", got, want)
+	}
+
+	// And with an identifier they can quote when something goes wrong.
+	if body.CorrelationID == "" {
+		t.Error("the response carries no correlation id")
+	}
+	if got := rec.Header().Get(correlation.HeaderName); got != body.CorrelationID {
+		t.Errorf("%s header = %q, want the body's %q", correlation.HeaderName, got, body.CorrelationID)
+	}
+}
+
+// A caller-supplied correlation id is honoured, so a trace that started
+// upstream carries on rather than restarting at this service.
+func TestASuppliedCorrelationIDIsKept(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tickets/purchase", nil)
+	req.Header.Set(userIDHeader, "student-1")
+	req.Header.Set(correlation.HeaderName, "trace-from-the-gateway")
+
+	rec := httptest.NewRecorder()
+	purchaseRoutes(&stubPurchaser{}).ServeHTTP(rec, req)
+
+	if got := rec.Header().Get(correlation.HeaderName); got != "trace-from-the-gateway" {
+		t.Errorf("%s = %q, want the value the caller sent", correlation.HeaderName, got)
+	}
+}
+
+func TestTheStatusEndpointReportsThePurchase(t *testing.T) {
 	stub := &stubPurchaser{purchase: domain.Purchase{
 		ID:         "b0a1c2d3-0000-4000-8000-000000000000",
 		CampaignID: testCampaign,
@@ -73,21 +156,50 @@ func TestASuccessfulPurchaseReturnsTheTicket(t *testing.T) {
 		Status:     domain.StatusConfirmed,
 	}}
 
-	rec := postPurchase(t, purchaseRoutes(stub), "student-1")
+	rec := getStatus(purchaseRoutes(stub), "student-1", stub.purchase.ID)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body)
 	}
 
-	var body purchaseResponse
+	var body statusResponse
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decoding body: %v", err)
 	}
-	if body.PurchaseID != stub.purchase.ID {
-		t.Errorf("purchase_id = %q, want %q", body.PurchaseID, stub.purchase.ID)
-	}
 	if body.Status != string(domain.StatusConfirmed) {
 		t.Errorf("status = %q, want %q", body.Status, domain.StatusConfirmed)
+	}
+}
+
+// Somebody else's purchase is reported as missing, not as forbidden.
+//
+// "This exists but is not yours" confirms that a guessed identifier is real,
+// which is a slow but perfectly good way to enumerate other people's tickets.
+func TestOnePersonCannotReadAnothersPurchase(t *testing.T) {
+	stub := &stubPurchaser{purchase: domain.Purchase{
+		ID:         "b0a1c2d3-0000-4000-8000-000000000000",
+		CampaignID: testCampaign,
+		UserID:     "student-1",
+		Status:     domain.StatusConfirmed,
+	}}
+
+	rec := getStatus(purchaseRoutes(stub), "student-2", stub.purchase.ID)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := decodeErrorCode(t, rec); got != "purchase_not_found" {
+		t.Errorf("code = %q, want purchase_not_found", got)
+	}
+}
+
+func TestAMissingPurchaseIsReportedAsSuch(t *testing.T) {
+	stub := &stubPurchaser{readErr: domain.ErrPurchaseNotFound}
+
+	rec := getStatus(purchaseRoutes(stub), "student-1", "b0a1c2d3-0000-4000-8000-000000000000")
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
 

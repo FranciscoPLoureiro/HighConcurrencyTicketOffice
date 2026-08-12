@@ -30,7 +30,7 @@ func TestARestartDoesNotRefillTheStock(t *testing.T) {
 	h.openCampaign(t, stock)
 
 	for i := range sold {
-		if _, err := h.service.Purchase(ctx, testCampaign, student(i)); err != nil {
+		if _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); err != nil {
 			t.Fatalf("purchase %d = %v", i, err)
 		}
 	}
@@ -67,7 +67,7 @@ func TestReconciliationOverwritesAConfidentlyWrongStock(t *testing.T) {
 	h.openCampaign(t, 100)
 
 	for i := range 40 {
-		if _, err := h.service.Purchase(ctx, testCampaign, student(i)); err != nil {
+		if _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); err != nil {
 			t.Fatalf("purchase %d = %v", i, err)
 		}
 	}
@@ -107,7 +107,7 @@ func TestReconciliationRestoresWhoAlreadyBought(t *testing.T) {
 
 	const buyers = 40
 	for i := range buyers {
-		if _, err := h.service.Purchase(ctx, testCampaign, student(i)); err != nil {
+		if _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); err != nil {
 			t.Fatalf("purchase %d = %v", i, err)
 		}
 	}
@@ -127,7 +127,7 @@ func TestReconciliationRestoresWhoAlreadyBought(t *testing.T) {
 
 	// The behaviour that matters: somebody who already has a ticket is still
 	// refused after the restart.
-	_, err := restarted.Purchase(ctx, testCampaign, student(0))
+	_, err := restarted.Purchase(ctx, testCampaign, student(0), newKey())
 	if !errors.Is(err, domain.ErrAlreadyPurchased) {
 		t.Errorf("an existing holder buying again after a restart = %v, want %v",
 			err, domain.ErrAlreadyPurchased)
@@ -152,7 +152,7 @@ func TestConcurrentReconciliationsAgreeOnOneAnswer(t *testing.T) {
 	h.openCampaign(t, 100)
 
 	for i := range 25 {
-		if _, err := h.service.Purchase(ctx, testCampaign, student(i)); err != nil {
+		if _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); err != nil {
 			t.Fatalf("purchase %d = %v", i, err)
 		}
 	}
@@ -203,7 +203,7 @@ func TestTheCampaignResumesExactlyWhereItStopped(t *testing.T) {
 	h.openCampaign(t, 10)
 
 	for i := range 4 {
-		if _, err := h.service.Purchase(ctx, testCampaign, student(i)); err != nil {
+		if _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); err != nil {
 			t.Fatalf("purchase %d = %v", i, err)
 		}
 	}
@@ -215,19 +215,19 @@ func TestTheCampaignResumesExactlyWhereItStopped(t *testing.T) {
 
 	// Six left, and the seventh newcomer is refused.
 	for i := 100; i < 106; i++ {
-		if _, err := restarted.Purchase(ctx, testCampaign, student(i)); err != nil {
+		if _, err := restarted.Purchase(ctx, testCampaign, student(i), newKey()); err != nil {
 			t.Fatalf("purchase after restart by %s = %v, want success", student(i), err)
 		}
 	}
 
-	_, err := restarted.Purchase(ctx, testCampaign, student(200))
+	_, err := restarted.Purchase(ctx, testCampaign, student(200), newKey())
 	if !errors.Is(err, domain.ErrSoldOut) {
 		t.Errorf("the eleventh ticket = %v, want %v", err, domain.ErrSoldOut)
 	}
 
-	confirmed, err := h.store.CountConfirmed(ctx, testCampaign)
+	confirmed, err := h.store.CountLiveTickets(ctx, testCampaign)
 	if err != nil {
-		t.Fatalf("CountConfirmed() = %v", err)
+		t.Fatalf("CountLiveTickets() = %v", err)
 	}
 	if confirmed != 10 {
 		t.Errorf("postgres recorded %d purchases across the restart, want 10", confirmed)

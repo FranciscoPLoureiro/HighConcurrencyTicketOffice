@@ -33,6 +33,21 @@ type Config struct {
 	RedisAddr     string
 	RedisPassword string
 
+	// RabbitMQURL addresses the broker that carries a sold ticket to the
+	// worker that finishes it.
+	RabbitMQURL string
+
+	// PublisherChannels is how many confirmed publishes the API may have in
+	// flight, and WorkerPrefetch is how many unacknowledged messages one
+	// worker will hold.
+	PublisherChannels int
+	WorkerPrefetch    int
+
+	// FulfilmentDelay stands in for generating a PDF. It is configuration
+	// rather than a constant so that the integration tests do not have to
+	// wait two seconds per message to prove something unrelated to waiting.
+	FulfilmentDelay time.Duration
+
 	// CampaignID names the campaign this process serves, and TotalTickets
 	// is how many exist. The campaign row is created from these once and
 	// never reset, so changing TotalTickets does not resize a campaign that
@@ -47,6 +62,27 @@ type Config struct {
 	RateLimitWindow time.Duration
 	RateLimitUser   int
 	RateLimitIP     int
+
+	// IdempotencyLease is how long an unfinished request holds its key
+	// against a retry, and IdempotencyRetention is how long the answer it
+	// produced stays replayable.
+	IdempotencyLease     time.Duration
+	IdempotencyRetention time.Duration
+
+	// The budgets every outbound call runs under. Nothing this service does
+	// is allowed to wait indefinitely on another system: a caller who has
+	// given up must stop costing resources, and a dependency that has
+	// stopped answering must fail rather than accumulate goroutines holding
+	// pool connections until the process falls over.
+	//
+	// RequestTimeout bounds a whole purchase, and the three below bound the
+	// individual calls inside it. They are deliberately shorter than it, so
+	// that a single slow dependency is reported as that dependency being
+	// slow rather than as the request as a whole timing out.
+	RequestTimeout  time.Duration
+	RedisTimeout    time.Duration
+	PostgresTimeout time.Duration
+	PublishTimeout  time.Duration
 
 	// LogLevel is the minimum level emitted by the structured logger.
 	LogLevel slog.Level
@@ -92,6 +128,50 @@ const (
 	// working, and the k6 output counts the two refusal reasons separately
 	// so the difference is visible rather than mysterious.
 	defaultRateLimitIP = 1000
+
+	// A lease has to outlast the request it is protecting, or a retry
+	// arriving while the first attempt is still working claims a key that
+	// was never free and buys a second ticket. Thirty seconds is twice the
+	// server's own write timeout, so a request that is still running has
+	// already been abandoned by the HTTP layer.
+	defaultIdempotencyLease = 30 * time.Second
+	// Retention answers a different question: how long after giving up might
+	// somebody try again? A day covers a client that retried after a crash,
+	// a phone that regained signal, or a person who reopened the tab in the
+	// morning, and costs a few hundred bytes per purchase to do it.
+	defaultIdempotencyRetention = 24 * time.Hour
+
+	defaultRabbitMQURL = "amqp://tickets:tickets@localhost:5672/" //nolint:gosec // G101: documented development default, as above
+
+	// Eight channels is comfortably more than the campaign needs — a hundred
+	// winners across the whole burst — and bounded so that a pathological
+	// load cannot ask the broker for a channel per request.
+	defaultPublisherChannels = 8
+	// Prefetch is per worker. Small enough that a second worker starting
+	// mid-campaign has something to do rather than watching the first work
+	// through a backlog it has already claimed, large enough that a worker
+	// is never idle waiting for the next message to be pushed. Fulfilment
+	// takes seconds, so the round trip this saves is noise either way and
+	// the spreading is the entire benefit.
+	defaultWorkerPrefetch = 4
+	// The brief's two seconds of pretending to draw a PDF.
+	defaultFulfilmentDelay = 2 * time.Second
+
+	// A purchase touches Redis once, PostgreSQL once and the broker once, so
+	// the sum of the three budgets below is the worst case, and the request
+	// budget sits above it with room for the handler itself.
+	defaultRequestTimeout = 10 * time.Second
+	// Redis is in the same datacentre and every operation it is asked for is
+	// a single script over a handful of keys. Two seconds is already far
+	// beyond healthy; anything slower is an incident, not a slow query.
+	defaultRedisTimeout = 2 * time.Second
+	// PostgreSQL gets longer because its work includes waiting on a row lock
+	// that another transaction holds, which is legitimate contention rather
+	// than a failure.
+	defaultPostgresTimeout = 5 * time.Second
+	// A confirmed publish waits for the broker to fsync, so this covers a
+	// disk that is briefly busy rather than only the network.
+	defaultPublishTimeout = 5 * time.Second
 )
 
 // Load reads configuration from the process environment.
@@ -107,6 +187,7 @@ func Load() (Config, error) {
 		PostgresDSN:     stringVar("POSTGRES_DSN", defaultPostgresDSN),
 		RedisAddr:       stringVar("REDIS_ADDR", defaultRedisAddr),
 		RedisPassword:   stringVar("REDIS_PASSWORD", ""),
+		RabbitMQURL:     stringVar("RABBITMQ_URL", defaultRabbitMQURL),
 		ShutdownTimeout: durationVar("SHUTDOWN_TIMEOUT", defaultShutdownTimeout, &errs),
 		LogLevel:        levelVar("LOG_LEVEL", defaultLogLevel, &errs),
 		CampaignID:      stringVar("CAMPAIGN_ID", defaultCampaignID),
@@ -114,6 +195,18 @@ func Load() (Config, error) {
 		RateLimitWindow: durationVar("RATE_LIMIT_WINDOW", defaultRateLimitWindow, &errs),
 		RateLimitUser:   intVar("RATE_LIMIT_USER", defaultRateLimitUser, &errs),
 		RateLimitIP:     intVar("RATE_LIMIT_IP", defaultRateLimitIP, &errs),
+
+		IdempotencyLease:     durationVar("IDEMPOTENCY_LEASE", defaultIdempotencyLease, &errs),
+		IdempotencyRetention: durationVar("IDEMPOTENCY_RETENTION", defaultIdempotencyRetention, &errs),
+
+		PublisherChannels: intVar("PUBLISHER_CHANNELS", defaultPublisherChannels, &errs),
+		WorkerPrefetch:    intVar("WORKER_PREFETCH", defaultWorkerPrefetch, &errs),
+		FulfilmentDelay:   durationVar("FULFILMENT_DELAY", defaultFulfilmentDelay, &errs),
+
+		RequestTimeout:  durationVar("REQUEST_TIMEOUT", defaultRequestTimeout, &errs),
+		RedisTimeout:    durationVar("REDIS_TIMEOUT", defaultRedisTimeout, &errs),
+		PostgresTimeout: durationVar("POSTGRES_TIMEOUT", defaultPostgresTimeout, &errs),
+		PublishTimeout:  durationVar("PUBLISH_TIMEOUT", defaultPublishTimeout, &errs),
 	}
 
 	errs = append(errs, cfg.validate()...)
@@ -158,6 +251,45 @@ func (c Config) validate() []error {
 	}
 	if c.RateLimitWindow <= 0 {
 		errs = append(errs, fmt.Errorf("RATE_LIMIT_WINDOW must be positive, got %s", c.RateLimitWindow))
+	}
+	// Neither of these may be switched off. A zero lease claims a key that
+	// expires before the request it protects finishes, and a zero retention
+	// keeps no answer to replay — in both cases the endpoint silently stops
+	// being idempotent while still demanding the header that says it is.
+	if c.IdempotencyLease <= 0 {
+		errs = append(errs, fmt.Errorf("IDEMPOTENCY_LEASE must be positive, got %s", c.IdempotencyLease))
+	}
+	if c.IdempotencyRetention <= 0 {
+		errs = append(errs, fmt.Errorf("IDEMPOTENCY_RETENTION must be positive, got %s", c.IdempotencyRetention))
+	}
+	if c.RabbitMQURL == "" {
+		errs = append(errs, errors.New("RABBITMQ_URL must not be empty"))
+	}
+	if c.PublisherChannels <= 0 {
+		errs = append(errs, fmt.Errorf("PUBLISHER_CHANNELS must be positive, got %d", c.PublisherChannels))
+	}
+	if c.WorkerPrefetch <= 0 {
+		errs = append(errs, fmt.Errorf("WORKER_PREFETCH must be positive, got %d", c.WorkerPrefetch))
+	}
+	// Zero is legitimate: it is what an integration test asks for when the
+	// point of the test is not the waiting. Negative is a typo.
+	if c.FulfilmentDelay < 0 {
+		errs = append(errs, fmt.Errorf("FULFILMENT_DELAY must not be negative, got %s", c.FulfilmentDelay))
+	}
+	// A timeout of zero is not "no limit" here, it is "give up immediately",
+	// and either reading would be a surprise. Neither is offered.
+	for _, budget := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"REQUEST_TIMEOUT", c.RequestTimeout},
+		{"REDIS_TIMEOUT", c.RedisTimeout},
+		{"POSTGRES_TIMEOUT", c.PostgresTimeout},
+		{"PUBLISH_TIMEOUT", c.PublishTimeout},
+	} {
+		if budget.value <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be positive, got %s", budget.name, budget.value))
+		}
 	}
 
 	return errs

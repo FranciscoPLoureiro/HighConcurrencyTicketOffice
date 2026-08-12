@@ -33,9 +33,9 @@ func TestASinglePurchaseIsRecordedAndDecrementsTheStock(t *testing.T) {
 		t.Error("purchase has no creation time; the database default did not come back")
 	}
 
-	sold, err := store.CountConfirmed(ctx, testCampaign)
+	sold, err := store.CountByStatus(ctx, testCampaign, domain.StatusConfirmed)
 	if err != nil {
-		t.Fatalf("CountConfirmed() = %v", err)
+		t.Fatalf("CountByStatus() = %v", err)
 	}
 	if sold != 1 {
 		t.Errorf("confirmed purchases = %d, want 1", sold)
@@ -158,9 +158,9 @@ func TestTheNaivePathOversellsUnderConcurrency(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	sold, err := store.CountConfirmed(ctx, testCampaign)
+	sold, err := store.CountByStatus(ctx, testCampaign, domain.StatusConfirmed)
 	if err != nil {
-		t.Fatalf("CountConfirmed() = %v", err)
+		t.Fatalf("CountByStatus() = %v", err)
 	}
 
 	t.Logf("stock was %d, %d requests arrived, %d tickets were sold (%d oversold)",
