@@ -118,7 +118,7 @@ func (s *Store) ReadCampaignState(ctx context.Context, campaignID string) (Campa
 	return state, nil
 }
 
-// RecordPurchase writes a ticket that Redis has already handed out.
+// RecordPending writes a ticket that Redis has already handed out.
 //
 // By the time this runs the decision is made: the Lua script decremented the
 // stock and claimed the user, and this is the source of truth catching up. The
@@ -126,17 +126,24 @@ func (s *Store) ReadCampaignState(ctx context.Context, campaignID string) (Campa
 // disagree, and because a purchase recorded without its decrement would survive
 // a reconciliation that trusts neither on its own.
 //
+// The row lands as 'pending', not 'confirmed'. Fulfilment happens in the worker
+// and takes seconds; the sale does not. What the row asserts from this moment
+// is that the seat is taken — which is the only thing reconciliation needs to
+// know, and the reason this write is on the critical path at all rather than
+// left to the worker as the brief's diagram suggests.
+//
 // The single-row UPDATE serialises every writer on the same tuple, which is the
 // contention phase 1 spent Redis to avoid — except that Redis has already
 // refused everyone who was going to lose. Only winners reach this function, so
 // the queue is one hundred rows deep for the whole campaign rather than five
 // thousand.
-func (s *Store) RecordPurchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error) {
+func (s *Store) RecordPending(ctx context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
 	purchase := domain.Purchase{
-		ID:         uuid.NewString(),
-		CampaignID: campaignID,
-		UserID:     userID,
-		Status:     domain.StatusConfirmed,
+		ID:             uuid.NewString(),
+		CampaignID:     campaignID,
+		UserID:         userID,
+		Status:         domain.StatusPending,
+		IdempotencyKey: idempotencyKey,
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -155,15 +162,24 @@ func (s *Store) RecordPurchase(ctx context.Context, campaignID, userID string) (
 	}
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO purchases (id, campaign_id, user_id, status)
-		VALUES ($1, $2, $3, $4)
-		RETURNING created_at`,
+		INSERT INTO purchases (id, campaign_id, user_id, status, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING created_at, updated_at`,
 		purchase.ID, purchase.CampaignID, purchase.UserID, purchase.Status,
-	).Scan(&purchase.CreatedAt)
+		nullable(purchase.IdempotencyKey),
+	).Scan(&purchase.CreatedAt, &purchase.UpdatedAt)
 
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
-		// The backstop index fired, which means Redis let through a second
+		// One of two backstops fired. Which one matters, because they mean
+		// opposite things about who was wrong.
+		if pgErr.ConstraintName == idempotencyKeyIndex {
+			// This key already created a purchase, so this is a retry that
+			// got past the idempotency check in Redis — the record expired,
+			// or Redis lost it. The database remembers what Redis forgot.
+			return domain.Purchase{}, domain.ErrIdempotencyKeyReplayed
+		}
+		// The fairness index fired, which means Redis let through a second
 		// ticket for someone who already had one. Reported as the ordinary
 		// refusal so the caller behaves sensibly, but it is not ordinary:
 		// the two systems disagreed and the database is the one that was
@@ -178,5 +194,100 @@ func (s *Store) RecordPurchase(ctx context.Context, campaignID, userID string) (
 		return domain.Purchase{}, fmt.Errorf("commit purchase: %w: %w", ErrOutcomeUnknown, err)
 	}
 
+	return purchase, nil
+}
+
+// idempotencyKeyIndex is the unique index added by migration 00003. Named here
+// so that RecordPending can tell its violation apart from the fairness index's.
+const idempotencyKeyIndex = "purchases_idempotency_key_idx"
+
+// nullable turns an absent string into a SQL NULL.
+//
+// The empty string and NULL are different facts and the idempotency_key column
+// needs the second one: ” is a value, and a unique index would let exactly one
+// row hold it and reject every other purchase made without a key. NULL means
+// "no key was given", and the index ignores it — which is what makes the column
+// safe to add to a table that already had rows.
+func nullable(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// purchaseColumns is the projection every read of a purchase uses, so that the
+// scan order below can only be wrong in one place.
+const purchaseColumns = `id, campaign_id, user_id, status,
+	coalesce(idempotency_key::text, ''), created_at, updated_at`
+
+func scanPurchase(row pgx.Row) (domain.Purchase, error) {
+	var p domain.Purchase
+	err := row.Scan(&p.ID, &p.CampaignID, &p.UserID, &p.Status,
+		&p.IdempotencyKey, &p.CreatedAt, &p.UpdatedAt)
+	return p, err
+}
+
+// ReadPurchase returns one purchase, scoped to its campaign.
+func (s *Store) ReadPurchase(ctx context.Context, campaignID, purchaseID string) (domain.Purchase, error) {
+	purchase, err := scanPurchase(s.pool.QueryRow(ctx,
+		`SELECT `+purchaseColumns+` FROM purchases WHERE campaign_id = $1 AND id = $2`,
+		campaignID, purchaseID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Purchase{}, domain.ErrPurchaseNotFound
+	}
+	if err != nil {
+		return domain.Purchase{}, fmt.Errorf("read purchase: %w", err)
+	}
+	return purchase, nil
+}
+
+// SettlePurchase moves a pending purchase to its final state.
+//
+// It is idempotent by construction, and it has to be: RabbitMQ delivers at
+// least once, so the worker will be handed the same message twice sooner or
+// later — a redelivery after a lost ack, a retry after a timeout that the
+// original attempt survived. The guard is in the WHERE clause rather than in a
+// read-then-write, because a read-then-write is the phase 1 race with different
+// nouns, and two workers racing on the same message would both pass it.
+//
+// A purchase already in the requested state is not an error: that is precisely
+// what a duplicate delivery looks like from here, and the caller should go on
+// to acknowledge the message rather than retry forever.
+func (s *Store) SettlePurchase(ctx context.Context, purchaseID string, status domain.Status) (domain.Purchase, error) {
+	purchase, err := scanPurchase(s.pool.QueryRow(ctx, `
+		UPDATE purchases SET status = $2, updated_at = now()
+		WHERE id = $1 AND status = $3
+		RETURNING `+purchaseColumns,
+		purchaseID, status, domain.StatusPending))
+	if err == nil {
+		return purchase, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return domain.Purchase{}, fmt.Errorf("settle purchase: %w", err)
+	}
+
+	// Nothing was pending. Either this already ran, or the row is in a state
+	// no fulfilment should move it out of, and the two need different answers.
+	current, err := s.readPurchaseByID(ctx, purchaseID)
+	switch {
+	case err != nil:
+		return domain.Purchase{}, err
+	case current.Status == status:
+		return current, nil
+	default:
+		return domain.Purchase{}, fmt.Errorf("%w: purchase is %s, not %s",
+			domain.ErrPurchaseNotPending, current.Status, domain.StatusPending)
+	}
+}
+
+func (s *Store) readPurchaseByID(ctx context.Context, purchaseID string) (domain.Purchase, error) {
+	purchase, err := scanPurchase(s.pool.QueryRow(ctx,
+		`SELECT `+purchaseColumns+` FROM purchases WHERE id = $1`, purchaseID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Purchase{}, domain.ErrPurchaseNotFound
+	}
+	if err != nil {
+		return domain.Purchase{}, fmt.Errorf("read purchase: %w", err)
+	}
 	return purchase, nil
 }

@@ -42,7 +42,7 @@ func TestFiveHundredBuyersAgainstOneHundredTicketsSellExactlyOneHundred(t *testi
 			defer wg.Done()
 			<-start
 
-			switch _, err := h.service.Purchase(ctx, testCampaign, student(i)); {
+			switch _, err := h.service.Purchase(ctx, testCampaign, student(i), newKey()); {
 			case err == nil:
 				sold.Add(1)
 			case errors.Is(err, domain.ErrSoldOut):
@@ -81,9 +81,9 @@ func TestFiveHundredBuyersAgainstOneHundredTicketsSellExactlyOneHundred(t *testi
 
 	// What Postgres believes. The two have to agree, or the invariant only
 	// held in the system that cannot be restarted.
-	confirmed, err := h.store.CountConfirmed(ctx, testCampaign)
+	confirmed, err := h.store.CountLiveTickets(ctx, testCampaign)
 	if err != nil {
-		t.Fatalf("CountConfirmed() = %v", err)
+		t.Fatalf("CountLiveTickets() = %v", err)
 	}
 	if confirmed != stock {
 		t.Errorf("postgres recorded %d purchases, want %d", confirmed, stock)
@@ -130,7 +130,7 @@ func TestOnePersonRacingThemselvesGetsOneTicket(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			switch _, err := h.service.Purchase(ctx, testCampaign, "eager-student"); {
+			switch _, err := h.service.Purchase(ctx, testCampaign, "eager-student", newKey()); {
 			case err == nil:
 				sold.Add(1)
 			case errors.Is(err, domain.ErrAlreadyPurchased):
@@ -166,19 +166,19 @@ func TestASoldOutCampaignStillTellsARepeatBuyerWhyTheyWereRefused(t *testing.T) 
 	h := newHarness(t)
 	h.openCampaign(t, 1)
 
-	if _, err := h.service.Purchase(ctx, testCampaign, "student-1"); err != nil {
+	if _, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey()); err != nil {
 		t.Fatalf("first purchase = %v", err)
 	}
 
 	// The campaign is now empty, so both refusals apply to this caller. The
 	// more specific one has to win, or the answer to "why was I refused?"
 	// depends on the order the script happened to check things in.
-	_, err := h.service.Purchase(ctx, testCampaign, "student-1")
+	_, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey())
 	if !errors.Is(err, domain.ErrAlreadyPurchased) {
 		t.Errorf("second purchase by the holder = %v, want %v", err, domain.ErrAlreadyPurchased)
 	}
 
-	_, err = h.service.Purchase(ctx, testCampaign, "student-2")
+	_, err = h.service.Purchase(ctx, testCampaign, "student-2", newKey())
 	if !errors.Is(err, domain.ErrSoldOut) {
 		t.Errorf("purchase by a newcomer = %v, want %v", err, domain.ErrSoldOut)
 	}
@@ -198,7 +198,7 @@ func TestAnUnreconciledCampaignIsNotReportedAsSoldOut(t *testing.T) {
 	// Deliberately no reconciliation: this is a process that skipped
 	// startup, or a Redis that was flushed underneath a running one.
 
-	_, err := h.service.Purchase(ctx, testCampaign, "student-1")
+	_, err := h.service.Purchase(ctx, testCampaign, "student-1", newKey())
 	if !errors.Is(err, domain.ErrCampaignNotFound) {
 		t.Errorf("purchase against an unreconciled campaign = %v, want %v", err, domain.ErrCampaignNotFound)
 	}

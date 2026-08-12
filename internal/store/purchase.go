@@ -94,33 +94,64 @@ func (s *Store) PurchaseNaively(ctx context.Context, campaignID, userID string) 
 	return purchase, nil
 }
 
-// CountConfirmed reports how many tickets the campaign has actually sold.
+// CountLiveTickets reports how many of the campaign's tickets are spoken for.
 //
-// This is what the oversell harness compares against the campaign total, and
-// what phase 2 reconciles Redis from at startup.
-func (s *Store) CountConfirmed(ctx context.Context, campaignID string) (int, error) {
-	var sold int
+// This is the number the oversell invariant is about, and the one to compare
+// against the campaign total. A ticket counts from the moment its row exists,
+// not from the moment fulfilment finishes: once phase 3 made fulfilment
+// asynchronous, "confirmed" started meaning "the document has been generated",
+// which is a fact about a background job and not about whether the seat is
+// taken. Counting confirmed rows during a campaign would report a system
+// selling far fewer tickets than it has.
+//
+// `<> 'cancelled'` rather than a list of the states that qualify, matching
+// domain.Status.Live, the partial unique index and the reconciliation query.
+func (s *Store) CountLiveTickets(ctx context.Context, campaignID string) (int, error) {
+	var live int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM purchases
+		WHERE campaign_id = $1 AND status <> $2`,
+		campaignID, domain.StatusCancelled,
+	).Scan(&live); err != nil {
+		return 0, fmt.Errorf("count live tickets: %w", err)
+	}
+	return live, nil
+}
+
+// CountByStatus reports how many purchases are in one state.
+//
+// Where CountLiveTickets measures the invariant, this measures progress: how
+// far the workers have got, and how many gave up. Those are operational
+// questions, and answering them with the same function that answers the
+// correctness question is how the two get confused.
+func (s *Store) CountByStatus(ctx context.Context, campaignID string, status domain.Status) (int, error) {
+	var count int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT count(*) FROM purchases
 		WHERE campaign_id = $1 AND status = $2`,
-		campaignID, domain.StatusConfirmed,
-	).Scan(&sold); err != nil {
-		return 0, fmt.Errorf("count confirmed purchases: %w", err)
+		campaignID, status,
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count %s purchases: %w", status, err)
 	}
-	return sold, nil
+	return count, nil
 }
 
 // CountUsersWithMultipleTickets reports how many people hold more than one
 // ticket. The fairness rule is only meaningful if it is measured.
+//
+// Live tickets, for the same reason as above and with a sharper edge: a person
+// holding two tickets one of which is still pending is exactly what a fairness
+// bug looks like while it is happening. Counting only confirmed rows would find
+// nothing until the workers caught up, by which time the campaign is over.
 func (s *Store) CountUsersWithMultipleTickets(ctx context.Context, campaignID string) (int, error) {
 	var offenders int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT count(*) FROM (
 			SELECT user_id FROM purchases
-			WHERE campaign_id = $1 AND status = $2
+			WHERE campaign_id = $1 AND status <> $2
 			GROUP BY user_id HAVING count(*) > 1
 		) AS duplicated`,
-		campaignID, domain.StatusConfirmed,
+		campaignID, domain.StatusCancelled,
 	).Scan(&offenders); err != nil {
 		return 0, fmt.Errorf("count users with multiple tickets: %w", err)
 	}

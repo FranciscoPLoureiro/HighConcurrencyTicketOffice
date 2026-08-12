@@ -20,6 +20,7 @@ import (
 
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/cache"
 	"github.com/FranciscoPLoureiro/HighConcurrencyTicketOffice/internal/store"
+	"github.com/google/uuid"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
@@ -168,3 +169,9 @@ func openCache(t *testing.T, addr string) *cache.Cache {
 // holding a ticket already is a real signal rather than the test reusing one
 // account.
 func student(i int) string { return "student-" + strconv.Itoa(i) }
+
+// newKey produces a fresh idempotency key, which is what a client that has not
+// retried anything sends. Tests about retrying send the same one twice on
+// purpose; everywhere else a new key per attempt is the honest default, because
+// reusing one would silently make half these tests replays.
+func newKey() string { return uuid.NewString() }

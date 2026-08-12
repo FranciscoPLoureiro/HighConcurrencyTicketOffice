@@ -39,7 +39,7 @@ type Decider interface {
 
 // Recorder is the source of truth.
 type Recorder interface {
-	RecordPurchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error)
+	RecordPending(ctx context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error)
 	ReadCampaignState(ctx context.Context, campaignID string) (store.CampaignState, error)
 }
 
@@ -73,7 +73,7 @@ const compensationBudget = 5 * time.Second
 // dies between the two, or the reply to either write is simply lost — the
 // ticket stays out of circulation until something notices. Phase 5 is where
 // something notices.
-func (s *Service) Purchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error) {
+func (s *Service) Purchase(ctx context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
 	outcome, remaining, err := s.cache.Purchase(ctx, campaignID, userID)
 	if err != nil {
 		// Fail closed. Redis is the only place the stock invariant is
@@ -98,7 +98,7 @@ func (s *Service) Purchase(ctx context.Context, campaignID, userID string) (doma
 	case cache.Sold:
 	}
 
-	purchase, err := s.store.RecordPurchase(ctx, campaignID, userID)
+	purchase, err := s.store.RecordPending(ctx, campaignID, userID, idempotencyKey)
 	if err != nil {
 		// Hand the ticket back only when the write is known not to have
 		// happened. A failure at COMMIT does not say that, and treating it as

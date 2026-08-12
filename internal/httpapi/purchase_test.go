@@ -23,11 +23,13 @@ type stubPurchaser struct {
 	err      error
 	// calls records what the handler passed down, which is how the test
 	// catches a handler that sells the wrong campaign or loses the user.
-	calls []struct{ campaignID, userID string }
+	calls []purchaseCall
 }
 
-func (s *stubPurchaser) Purchase(_ context.Context, campaignID, userID string) (domain.Purchase, error) {
-	s.calls = append(s.calls, struct{ campaignID, userID string }{campaignID, userID})
+type purchaseCall struct{ campaignID, userID, idempotencyKey string }
+
+func (s *stubPurchaser) Purchase(_ context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
+	s.calls = append(s.calls, purchaseCall{campaignID, userID, idempotencyKey})
 	return s.purchase, s.err
 }
 

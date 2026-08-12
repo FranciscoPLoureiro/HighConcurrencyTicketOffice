@@ -18,7 +18,7 @@ import (
 // transport layer noticing, and so the handler's own behaviour can be tested
 // against every refusal reason without a database.
 type Purchaser interface {
-	Purchase(ctx context.Context, campaignID, userID string) (domain.Purchase, error)
+	Purchase(ctx context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error)
 }
 
 // Config carries the Server's dependencies.

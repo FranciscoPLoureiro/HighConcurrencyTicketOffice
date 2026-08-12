@@ -20,6 +20,10 @@ import (
 // Everything about atomicity is tested against containers instead, in the
 // files behind the integration tag. These two suites are not alternatives.
 
+// testKey is a fixed idempotency key. These tests never send two requests, so
+// the value only has to be a plausible UUID and the same one throughout.
+const testKey = "3f1a0c9e-0000-4000-8000-000000000001"
+
 // stubDecider stands in for Redis.
 type stubDecider struct {
 	outcome   cache.Outcome
@@ -56,11 +60,14 @@ type stubRecorder struct {
 	err error
 }
 
-func (r *stubRecorder) RecordPurchase(_ context.Context, campaignID, userID string) (domain.Purchase, error) {
+func (r *stubRecorder) RecordPending(_ context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
 	if r.err != nil {
 		return domain.Purchase{}, r.err
 	}
-	return domain.Purchase{ID: "purchase-1", CampaignID: campaignID, UserID: userID}, nil
+	return domain.Purchase{
+		ID: "purchase-1", CampaignID: campaignID, UserID: userID,
+		Status: domain.StatusPending, IdempotencyKey: idempotencyKey,
+	}, nil
 }
 
 func (r *stubRecorder) ReadCampaignState(context.Context, string) (store.CampaignState, error) {
@@ -80,7 +87,7 @@ func TestAKnownFailedWriteReturnsTheTicket(t *testing.T) {
 	decider := &stubDecider{outcome: cache.Sold, remaining: 41}
 	recorder := &stubRecorder{err: errors.New("connection refused")}
 
-	_, err := newTestService(decider, recorder).Purchase(context.Background(), "queima", "student-1")
+	_, err := newTestService(decider, recorder).Purchase(context.Background(), "queima", "student-1", testKey)
 	if err == nil {
 		t.Fatal("Purchase() = nil, want an error")
 	}
@@ -92,7 +99,7 @@ func TestAKnownFailedWriteReturnsTheTicket(t *testing.T) {
 
 // A write whose fate is unknown must not.
 //
-// This is the bug this test was written for. RecordPurchase reports
+// This is the bug this test was written for. RecordPending reports
 // ErrOutcomeUnknown when it failed at COMMIT, which is the one point where the
 // transaction may have been applied anyway — the server committed and the
 // acknowledgement was lost, or the caller's context expired while the server
@@ -108,7 +115,7 @@ func TestAWriteWithAnUnknownOutcomeKeepsTheTicketOutOfCirculation(t *testing.T) 
 		err: fmt.Errorf("commit purchase: %w: %w", store.ErrOutcomeUnknown, context.DeadlineExceeded),
 	}
 
-	_, err := newTestService(decider, recorder).Purchase(context.Background(), "queima", "student-1")
+	_, err := newTestService(decider, recorder).Purchase(context.Background(), "queima", "student-1", testKey)
 	if !errors.Is(err, store.ErrOutcomeUnknown) {
 		t.Fatalf("Purchase() = %v, want it to wrap %v", err, store.ErrOutcomeUnknown)
 	}
@@ -132,7 +139,7 @@ func TestCompensationSurvivesTheCancellationThatCausedIt(t *testing.T) {
 	decider := &stubDecider{outcome: cache.Sold, remaining: 41}
 	recorder := &stubRecorder{err: context.Canceled}
 
-	if _, err := newTestService(decider, recorder).Purchase(ctx, "queima", "student-1"); err == nil {
+	if _, err := newTestService(decider, recorder).Purchase(ctx, "queima", "student-1", testKey); err == nil {
 		t.Fatal("Purchase() = nil, want an error")
 	}
 
@@ -159,7 +166,7 @@ func TestRefusalsCompensateNothing(t *testing.T) {
 			decider := &stubDecider{outcome: tt.outcome}
 
 			_, err := newTestService(decider, &stubRecorder{}).Purchase(
-				context.Background(), "queima", "student-1")
+				context.Background(), "queima", "student-1", testKey)
 			if !errors.Is(err, tt.want) {
 				t.Errorf("Purchase() = %v, want %v", err, tt.want)
 			}
@@ -177,7 +184,7 @@ func TestADeciderThatCannotAnswerFailsClosed(t *testing.T) {
 	recorder := &stubRecorder{}
 
 	if _, err := newTestService(decider, recorder).Purchase(
-		context.Background(), "queima", "student-1"); err == nil {
+		context.Background(), "queima", "student-1", testKey); err == nil {
 		t.Fatal("Purchase() = nil, want an error — selling without Redis oversells")
 	}
 }
