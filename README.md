@@ -1203,9 +1203,13 @@ of this sale" and "PostgreSQL did not reply" are indistinguishable if the error
 is ignored, and acting on the second hands back seats people are holding.
 
 `RESERVATION_AGE` is the one setting in this project that can cause an oversell,
-so the service **refuses to start** unless it is comfortably longer than
-`REQUEST_TIMEOUT`. A reservation released while its request is still running
-sells one seat twice.
+so the service **refuses to start** unless it is at least `REQUEST_TIMEOUT` plus
+`POSTGRES_TIMEOUT`. Outlasting the request alone is not enough: a `COMMIT`
+abandoned when the budget expired may still be applied by a server that never
+heard the caller give up, and until it lands the sweeper's question — does
+PostgreSQL know about this sale? — answers no about a sale that is about to
+exist. The margin has to cover the database finishing work the request gave up
+on, not just the request.
 
 There is a second window — the row committed and the publish did not — and it is
 swept differently. That purchase is a real sale whose seat is genuinely taken;
@@ -1220,7 +1224,7 @@ exercise made obvious:
 
 ```bash
 make up
-FAULT_INJECTION=after-decrement RESERVATION_AGE=15s SWEEP_INTERVAL=5s   docker compose up -d --wait api
+FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s   RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
 
 # three sales that die between the decrement and the record
 purchase 1 -> http 500
@@ -1429,8 +1433,9 @@ Kept honest as the project grows.
   else here errs towards keeping a ticket off the shelf; this is the only thing
   whose job is to put one back. It is guarded by asking the source of truth
   before every release, by treating an unanswered query as "do not touch", and
-  by a startup check that refuses a `RESERVATION_AGE` shorter than the request
-  budget — but it is the piece to read first if a ticket is ever sold twice.
+  by a startup check that refuses a `RESERVATION_AGE` which does not outlast the
+  request budget *and* one more database budget — but it is the piece to read
+  first if a ticket is ever sold twice.
 - **Fault injection is a test tool that ships in the binary.** `FAULT_INJECTION`
   is empty everywhere except a deliberate demonstration, and an unrecognised
   value refuses to start rather than disarming quietly. It is still a switch

@@ -81,11 +81,17 @@ type countingHandler struct {
 	calls  int
 	status int
 	body   string
+	// headers stands in for whatever the real handler sets beside the body —
+	// the Location a 202 carries, in particular.
+	headers http.Header
 }
 
 func (h *countingHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	h.calls++
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	for name, values := range h.headers {
+		w.Header()[name] = values
+	}
 	w.WriteHeader(h.status)
 	_, _ = w.Write([]byte(h.body))
 }
@@ -144,6 +150,34 @@ func TestARetryWithTheSameKeyGetsTheOriginalAnswerAndDoesNoWork(t *testing.T) {
 	}
 	if first.Header().Get(replayHeader) != "" {
 		t.Errorf("%s was set on the first answer, which was not a replay", replayHeader)
+	}
+}
+
+// The replay is the same response, headers included.
+//
+// A purchase answers 202 with a Location pointing at the status resource, and
+// that is the answer worth replaying properly: the client asking again is one
+// that never saw the first response, so the header is the only pointer it has
+// ever had. Serving a 202 that says nothing about where the ticket is makes the
+// retry worse than the attempt it is repeating.
+func TestAReplayCarriesTheHeadersTheFirstAnswerHad(t *testing.T) {
+	const location = "/api/v1/tickets/abc/status"
+
+	handler := &countingHandler{status: http.StatusAccepted, body: `{"purchase_id":"abc"}`}
+	handler.headers = http.Header{"Location": []string{location}}
+	routes := idempotentRoutes(t, newMemoryStore(), handler)
+
+	first := postWithKey(routes, "student-1", testIdempotencyKey)
+	second := postWithKey(routes, "student-1", testIdempotencyKey)
+
+	if first.Header().Get("Location") != location {
+		t.Fatalf("the first answer's Location = %q, want %q", first.Header().Get("Location"), location)
+	}
+	if got := second.Header().Get("Location"); got != location {
+		t.Errorf("the replay's Location = %q, want %q — the retry was told nothing about where its ticket is", got, location)
+	}
+	if second.Header().Get(replayHeader) != "true" {
+		t.Errorf("%s = %q on the replay, want \"true\"", replayHeader, second.Header().Get(replayHeader))
 	}
 }
 

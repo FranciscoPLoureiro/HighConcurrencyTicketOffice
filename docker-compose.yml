@@ -30,12 +30,21 @@ services:
       # Overridable so the lost-ticket demonstration can be run against this
       # stack without editing anything. See "the lost ticket" in the README:
       #
-      #   FAULT_INJECTION=after-decrement RESERVATION_AGE=15s SWEEP_INTERVAL=5s       #     docker compose up -d --wait api
+      #   FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s \
+      #     RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
+      #
+      # The request budget comes down with the reservation age, and has to:
+      # the API refuses to start unless a reservation outlasts a request plus
+      # one more database budget, because a COMMIT abandoned at the deadline
+      # can still land afterwards and the sweeper would release a seat that is
+      # about to be taken. Shortening the recovery window safely means
+      # shortening what it has to outlast.
       #
       # FAULT_INJECTION is empty everywhere else, and an unrecognised value
       # makes the API refuse to start rather than disarm quietly.
       FAULT_INJECTION: "${FAULT_INJECTION:-}"
       FAULT_KILL: "${FAULT_KILL:-false}"
+      REQUEST_TIMEOUT: "${REQUEST_TIMEOUT:-10s}"
       RESERVATION_AGE: "${RESERVATION_AGE:-60s}"
       SWEEP_INTERVAL: "${SWEEP_INTERVAL:-15s}"
     ports:

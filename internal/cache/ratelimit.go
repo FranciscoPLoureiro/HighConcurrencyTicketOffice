@@ -19,13 +19,16 @@ import (
 func (c *Cache) Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, time.Duration, error) {
 	allowed, retryMS, err := intPair(c.rateLimit.Run(ctx, c.client,
 		[]string{key},
-		time.Now().UnixMilli(),
 		window.Milliseconds(),
 		limit,
 		// Unique per request: two requests landing in the same millisecond
 		// would otherwise share a sorted set member and count once. Passed
-		// in rather than generated in Lua so the script stays deterministic
-		// and safe to replicate.
+		// in because Redis seeds Lua's PRNG identically on every invocation,
+		// so a member generated inside the script would be the same member
+		// for every request.
+		//
+		// The clock is *not* passed in, and deliberately: the script reads
+		// Redis's own. See scripts/ratelimit.lua.
 		uuid.NewString(),
 	).Result())
 	if err != nil {

@@ -53,9 +53,11 @@ type Recorder interface {
 	ReadCampaignState(ctx context.Context, campaignID string) (store.CampaignState, error)
 
 	// What the sweeper asks before it gives a ticket back, and what it reads
-	// to find sales nothing is fulfilling.
+	// to find sales nothing is fulfilling. MarkRepublished is how a pass
+	// tells the next one that it has already dealt with a purchase.
 	HasLiveTicket(ctx context.Context, campaignID, userID string) (bool, error)
 	StalledPurchases(ctx context.Context, campaignID string, olderThan time.Duration, limit int) ([]domain.Purchase, error)
+	MarkRepublished(ctx context.Context, purchaseID string) error
 }
 
 // Fulfiller takes a sold ticket away to be finished elsewhere.

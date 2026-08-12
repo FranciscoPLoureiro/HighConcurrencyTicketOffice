@@ -90,6 +90,14 @@ type stubRecorder struct {
 	liveErr    error
 	liveLookup func() (bool, error)
 	stalled    []domain.Purchase
+
+	// republished stands in for the timestamp the real store bumps. A
+	// purchase that has been marked has not sat unchanged for PendingAge any
+	// more, so the next pass does not see it — which is the whole point of
+	// the mark and cannot be observed at all if the stub keeps handing back
+	// the same list.
+	republished map[string]bool
+	markErr     error
 }
 
 func (r *stubRecorder) RecordPending(_ context.Context, campaignID, userID, idempotencyKey string) (domain.Purchase, error) {
@@ -126,7 +134,24 @@ func (r *stubRecorder) HasLiveTicket(context.Context, string, string) (bool, err
 }
 
 func (r *stubRecorder) StalledPurchases(context.Context, string, time.Duration, int) ([]domain.Purchase, error) {
-	return r.stalled, nil
+	stalled := make([]domain.Purchase, 0, len(r.stalled))
+	for _, purchase := range r.stalled {
+		if !r.republished[purchase.ID] {
+			stalled = append(stalled, purchase)
+		}
+	}
+	return stalled, nil
+}
+
+func (r *stubRecorder) MarkRepublished(_ context.Context, purchaseID string) error {
+	if r.markErr != nil {
+		return r.markErr
+	}
+	if r.republished == nil {
+		r.republished = make(map[string]bool)
+	}
+	r.republished[purchaseID] = true
+	return nil
 }
 
 // stubFulfiller stands in for RabbitMQ.

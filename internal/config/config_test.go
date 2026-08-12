@@ -240,6 +240,41 @@ func TestAReservationShorterThanTheRequestBudgetIsRejected(t *testing.T) {
 	}
 }
 
+// Outlasting the request is not enough, and this is the value that proves it.
+//
+// Eleven seconds against a ten second budget passes "longer than the request",
+// and leaves one second for a COMMIT the request abandoned to be applied by a
+// server that never heard it give up. Until that write lands the sweeper's
+// question answers "PostgreSQL has never heard of this sale" about a sale that
+// is about to exist, and releasing there sells the seat twice. The margin has
+// to cover the database, not just the caller.
+func TestAReservationWithNoRoomForALateCommitIsRejected(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("REQUEST_TIMEOUT", "10s")
+	t.Setenv("POSTGRES_TIMEOUT", "5s")
+	t.Setenv("RESERVATION_AGE", "11s")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted a reservation age with one second of margin over the request budget")
+	}
+	if !strings.Contains(err.Error(), "POSTGRES_TIMEOUT") {
+		t.Errorf("error %q does not mention POSTGRES_TIMEOUT, which is half of the floor", err)
+	}
+}
+
+// And the floor is a floor, not a wall: a value that clears it starts.
+func TestAReservationThatCoversBothBudgetsIsAccepted(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("REQUEST_TIMEOUT", "10s")
+	t.Setenv("POSTGRES_TIMEOUT", "5s")
+	t.Setenv("RESERVATION_AGE", "15s")
+
+	if _, err := Load(); err != nil {
+		t.Errorf("Load() = %v, want a reservation age equal to the floor to be accepted", err)
+	}
+}
+
 func TestNonPositiveShutdownTimeoutIsRejected(t *testing.T) {
 	clearEnv(t)
 	// Zero would make graceful shutdown a no-op, quietly turning every
