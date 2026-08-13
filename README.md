@@ -153,9 +153,11 @@ a client should switch on `error.code`, never on the message.
 | `429` | `rate_limited` | Too many attempts; see `Retry-After` |
 | `400` | `missing_idempotency_key` | No `Idempotency-Key` header |
 | `400` | `invalid_idempotency_key` | The key is not a UUID |
+| `400` | `invalid_identity` | The `X-User-ID` header is longer than 128 bytes |
 | `401` | `missing_identity` | No `X-User-ID` header |
 | `404` | `campaign_not_found` | No such campaign, or Redis holds no stock for it |
 | `404` | `purchase_not_found` | No such purchase — or it belongs to somebody else |
+| `500` | `internal_error` | The system could not decide; nothing is implied about the ticket |
 
 ```json
 { "error": { "code": "already_purchased",
@@ -1003,9 +1005,47 @@ the dead letter queue, which is the price of not hammering a dependency that is
 already struggling. Some failures skip the waits entirely: a message naming a
 purchase that does not exist, or one already cancelled, fails identically every
 time, so it is marked permanent and parked immediately rather than spending two
-waits proving what the first attempt already knew. Nothing consumes the dead
-letter queue — its purpose is to stop and be looked at, and phase 5.3 is where a
-compensation saga drains it.
+waits proving what the first attempt already knew. The dead letter queue was
+where a message stopped to be looked at; since phase 5.3 a compensation saga
+drains it instead, which is a change of role defended in its own section below.
+
+### Graceful shutdown, and the number that overrides it
+
+**Context.** The brief asks that a deploy not corrupt state: on `SIGTERM` the
+API should stop accepting new requests and finish the ones in flight, and the
+worker should finish the message in its hand before closing. Both processes do
+exactly that. The API traps the signal before it opens a single dependency,
+calls `srv.Shutdown` with `SHUTDOWN_TIMEOUT`, and then waits for the sweeper
+pass to end rather than cutting it off holding the reconciliation lock. The
+worker's consumer stops pulling deliveries and lets the message already
+dispatched run to completion, because the handler's context is deliberately
+detached from the one the signal cancels.
+
+**The part that is easy to miss.** None of that is worth anything if something
+kills the process first, and something always will. Whatever runs the
+container sends `SIGTERM`, waits, and then sends `SIGKILL`; Docker's default
+wait is **ten seconds**. Both processes here are configured to need more than
+that — the API has fifteen seconds of drain budget before the sweeper wait, and
+the worker's per-message budget is `FULFILMENT_DELAY + POSTGRES_TIMEOUT` plus a
+margin, twelve seconds with the defaults. So the graceful shutdown was correct
+in the code and unreachable in practice, on every `compose stop`, every
+`restart`, and every recreate — including the API restart in `scripts/reset.sh`
+that runs before each load test.
+
+**Decision.** `stop_grace_period` is set explicitly on both services, above
+what either process can take. It is a number to keep in step: raising
+`SHUTDOWN_TIMEOUT` or `FULFILMENT_DELAY` without raising it puts the guarantee
+back out of reach, silently.
+
+**Consequences.** Being generous costs nothing, because a process that has
+finished exits immediately and an idle one exits at once — the grace period is
+a ceiling, not a delay. And the failure it prevents was survivable rather than
+catastrophic: a killed worker leaves its message unacknowledged, so the broker
+redelivers it and the idempotent handler absorbs the duplicate. A killed API is
+worse, because a request cut between the Redis decrement and the PostgreSQL
+write is the lost ticket this project is about — recovered by the sweeper or by
+startup reconciliation, but caused by the very deploy that graceful shutdown was
+there to make clean.
 
 ### Sizing the connection pool, with the right knobs
 
@@ -1105,8 +1145,12 @@ across every threshold**, including a p99 that had never seen a single request.
 **Consequences.** `tickets_sold: count==100` guards the sale latency threshold,
 `refusals: count>1000` guards the refusal one, `http_reqs: count>1000` proves
 the script ran at all, and `undocumented_answers: count==0` is a counter this
-project controls rather than a metric whose semantics k6 might rename — as it
-did with `checks`, where the old name silently watches nothing.
+project controls rather than one whose name and semantics belong to k6. That is
+a reason to prefer it, not a claim that the built-in is broken: k6 now reports
+`checks_total`, `checks_succeeded` and `checks_failed` in the summary, and a
+threshold written against the older `checks` still evaluates — the CI run above
+scored it over two hundred thousand samples. It is kept for the summary line,
+and the counters are what the guarantee rests on.
 
 The latency thresholds themselves are on a `Trend` recorded by hand rather than
 on `http_req_duration`, because the outcome of a request is not knowable until
@@ -1224,7 +1268,8 @@ exercise made obvious:
 
 ```bash
 make up
-FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s   RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
+FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s \
+  RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
 
 # three sales that die between the decrement and the record
 purchase 1 -> http 500
@@ -1401,11 +1446,16 @@ Kept honest as the project grows.
   oversight: what belongs there is a notification service telling somebody their
   ticket failed, and inventing one would be scope with no design behind it.
 - **The API does not reconnect to RabbitMQ.** The worker does, and loops until
-  it succeeds; the API dials once at startup and, if the connection drops,
-  publishes fail and purchases are reversed until it is restarted. The worker is
-  the process where this matters — one that never reconnects is
-  indistinguishable from a healthy one with an empty queue — and the API at
-  least fails loudly rather than silently.
+  it succeeds; the API dials once at startup, and if that connection drops every
+  publish fails until the process is restarted — including the sweeper's, since
+  it runs inside the API and shares the connection. Those sales are left
+  **pending**, not reversed: an unconfirmed publish may have reached the broker,
+  so undoing it is the one thing that could sell a seat twice. The tickets stay
+  off the shelf, the callers get a `500`, and a restart is what puts it right —
+  reconciliation reads the pending rows as live and the sweeper republishes them
+  on a working connection. Measured, with the broker stopped and restarted
+  underneath a running API: fifteen sales left pending and still failing after
+  the broker came back.
 - Phase 1's naive purchase path is still in the tree, unused by the API. It is
   the baseline the table above is measured against, and an integration test
   asserts that it still oversells — if that ever stops reproducing, the

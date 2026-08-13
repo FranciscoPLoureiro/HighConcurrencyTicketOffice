@@ -24,6 +24,13 @@ import (
 // startBroker runs one throwaway RabbitMQ and returns a connection with the
 // topology already declared.
 func startBroker(t *testing.T) *Connection {
+	conn, _ := startBrokerContainer(t)
+	return conn
+}
+
+// startBrokerContainer is startBroker plus the container handle, for the one
+// test that has to take the broker away mid-flight.
+func startBrokerContainer(t *testing.T) (*Connection, testcontainers.Container) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -53,7 +60,7 @@ func startBroker(t *testing.T) *Connection {
 		}
 	})
 
-	return conn
+	return conn, container
 }
 
 func newTestPublisher(t *testing.T, conn *Connection) *Publisher {
@@ -296,5 +303,70 @@ func waitForQueueDepth(t *testing.T, conn *Connection, name string, want int, wi
 			return queueDepth(t, conn, name)
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// A publish must answer the caller even when the broker has stopped answering.
+//
+// The library makes this easy to get wrong.
+// PublishWithDeferredConfirmWithContext reads as though it honours a deadline,
+// and does not: it checks the context once before doing anything and then calls
+// the fully synchronous publish, which writes the frame under a
+// connection-wide mutex with no deadline of any kind. A broker that stops
+// reading without closing the socket therefore blocks the write, and with it
+// every other channel on that connection.
+//
+// What that costs sits well above this package. The sale has already taken a
+// ticket out of Redis and written a pending row by the time the publish runs,
+// so a publish that never returns is a request that never returns: the caller
+// is told nothing, the goroutine and its ticket are stranded, and neither
+// PUBLISH_TIMEOUT nor REQUEST_TIMEOUT can do anything about it — they cancel a
+// context nothing is reading any more.
+//
+// Note what this test does and does not prove. Stopping the container produces
+// a hanging write on some platforms and a clean connection reset on others, so
+// on a runner where the socket is reset this passes without exercising the
+// abandonment at all. The property asserted is the one that has to hold either
+// way: the call returns inside the caller's budget, whatever the broker does.
+func TestAPublishReturnsWhenTheBrokerStopsAnswering(t *testing.T) {
+	conn, container := startBrokerContainer(t)
+	publisher := newTestPublisher(t, conn)
+
+	// A sale first, so the test is measuring a publisher that was working.
+	if err := publisher.PublishTicket(context.Background(), testMessage("purchase-before")); err != nil {
+		t.Fatalf("PublishTicket() before the outage = %v", err)
+	}
+
+	timeout := 10 * time.Second
+	if err := container.Stop(context.Background(), &timeout); err != nil {
+		t.Fatalf("stopping the broker: %v", err)
+	}
+
+	const budget = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() { done <- publisher.PublishTicket(ctx, testMessage("purchase-during")) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("PublishTicket() = nil with the broker stopped, want a failure")
+		}
+		// Never reported as refused or unroutable. Those are definitive, and
+		// acting on them reverses the sale — which would be exactly wrong
+		// here, because the broker may have taken the message before it went.
+		for _, definitive := range []error{ErrPublishRefused, ErrUnroutable} {
+			if errors.Is(err, definitive) {
+				t.Errorf("reported %v, which tells the caller the message is certainly gone; it is not", definitive)
+			}
+		}
+		t.Logf("returned after %s: %v", time.Since(started).Round(time.Millisecond), err)
+
+	case <-time.After(budget + 8*time.Second):
+		t.Fatal("PublishTicket() never returned: the caller's budget cannot end a publish, " +
+			"so the request that made this sale would hang until the client gave up")
 	}
 }

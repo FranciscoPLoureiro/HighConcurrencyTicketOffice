@@ -131,6 +131,37 @@ func (p *Publisher) DeadLetter(ctx context.Context, message TicketMessage, attem
 	return p.publish(ctx, DeadKey, message, attempt)
 }
 
+// publish sends one message and waits for the broker to take responsibility for
+// it, or for the caller's budget to run out — whichever happens first.
+//
+// The wait is on a goroutine because the publish itself cannot be interrupted,
+// and the library's naming hides that. PublishWithDeferredConfirmWithContext
+// reads as though it honours a deadline; it checks the context once, before
+// doing anything, and then calls the fully synchronous publish. Nothing after
+// that point looks at the context again, and amqp091 clears the connection
+// deadline once the handshake is done, so the frame write has no deadline of
+// any kind.
+//
+// It matters when the broker stops answering without closing the socket — a
+// killed container, a partition, an Erlang VM that is up but wedged. The write
+// goes into a send buffer nobody drains and the call never returns. Every
+// budget above it is powerless: PUBLISH_TIMEOUT and REQUEST_TIMEOUT only cancel
+// a context this call has stopped reading, and the server's WriteTimeout only
+// fires when a handler writes, which one blocked here never does. The request
+// hangs until the client gives up, having taken a ticket and recorded a pending
+// row that the caller is never told about.
+//
+// So the goroutine does the blocking work and this selects on the context. The
+// answer to an abandoned publish is ErrPublishUnconfirmed, which is exactly
+// what it is: the message may or may not have reached the broker, so the sale
+// must not be reversed, the row stays pending, and the sweeper resolves it.
+//
+// The abandoned goroutine keeps the channel, and the channel is not returned to
+// the pool — amqp091 channels are not safe for concurrent use, and one with a
+// publish still inside it can never be handed to anybody else. That bounds the
+// damage rather than merely moving it: after PublisherChannels abandonments the
+// pool is empty, take blocks on the caller's context instead, and further
+// purchases fail fast rather than starting a goroutine each.
 func (p *Publisher) publish(ctx context.Context, routingKey string, message TicketMessage, attempt int) error {
 	frame, err := message.publishing(attempt)
 	if err != nil {
@@ -141,8 +172,27 @@ func (p *Publisher) publish(ctx context.Context, routingKey string, message Tick
 	if err != nil {
 		return err
 	}
-	defer func() { p.channels <- channel }()
 
+	// Buffered, so that the goroutine can always deliver its answer and exit
+	// even when nothing is waiting for it any more.
+	done := make(chan error, 1)
+	go func() { done <- p.send(ctx, channel, routingKey, message, frame) }()
+
+	select {
+	case err := <-done:
+		// Finished, so the channel is safe to reuse.
+		p.channels <- channel
+		return err
+
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", ErrPublishUnconfirmed, ctx.Err())
+	}
+}
+
+// send is the blocking half: everything that cannot be interrupted.
+func (p *Publisher) send(ctx context.Context, channel *confirmChannel,
+	routingKey string, message TicketMessage, frame amqp.Publishing,
+) error {
 	// Anything the broker returned about an earlier publish on this channel
 	// is stale by now and would be misread as this message coming back.
 	drain(channel.returns)

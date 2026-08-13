@@ -49,6 +49,20 @@ services:
       SWEEP_INTERVAL: "${SWEEP_INTERVAL:-15s}"
     ports:
       - "8080:8080"
+    # How long Docker waits after SIGTERM before sending SIGKILL.
+    #
+    # Set explicitly because the default is ten seconds and this process is
+    # configured to need more: SHUTDOWN_TIMEOUT gives the server fifteen to
+    # drain in-flight requests, and the sweeper pass it then waits for has a
+    # budget of SWEEP_INTERVAL on top. Left at the default, every `compose
+    # stop`, `restart` and recreate kills the API in the middle of the drain
+    # that graceful shutdown exists to perform — including the restart in
+    # scripts/reset.sh, which runs before every load test.
+    #
+    # Raise this with SHUTDOWN_TIMEOUT if that is ever raised. The cost of
+    # generosity is nothing: the process exits as soon as it is done, and an
+    # idle one exits immediately.
+    stop_grace_period: 30s
     # Explicit limits, because a load test against an unbounded container
     # measures the developer's laptop rather than the service. The README
     # declares the machine these were chosen for; the point is not the numbers
@@ -93,6 +107,19 @@ services:
       REDIS_ADDR: redis:6379
       RABBITMQ_URL: amqp://tickets:tickets@rabbitmq:5672/
       LOG_LEVEL: info
+    # The worker's equivalent, and it needs one for a sharper reason than the
+    # API does. The brief asks that a worker finish the message in its hand
+    # before it closes, and the consumer implements exactly that — it stops
+    # taking new deliveries and lets the one in flight run to completion under
+    # its own budget, which is FULFILMENT_DELAY plus POSTGRES_TIMEOUT plus a
+    # margin. That is twelve seconds with these defaults, against a ten second
+    # grace period, so the default made the guarantee unreachable by two
+    # seconds on every deploy.
+    #
+    # A killed message is not lost — it is unacknowledged, so the broker
+    # redelivers it and the handler is idempotent — but "we survive it" is not
+    # the same as "it does not happen", and the deliverable was the second one.
+    stop_grace_period: 30s
     # Explicit limits, because a load test against an unbounded container
     # measures the developer's laptop rather than the service. The README
     # declares the machine these were chosen for; the point is not the numbers
