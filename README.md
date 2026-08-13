@@ -579,10 +579,27 @@ postgres  100 live tickets, 0 users holding more than one, available=0
 ```
 
 Phase 1 sold not 101, not 140, but every ticket asked for: every request read
-the same availability, concluded it had the last one, and got it. The
-integration test reproduces it in miniature — 300 requests, 20 tickets, 300
-sold — and **asserts** the failure, so that if it ever stops reproducing the
-comparison above is known to be measuring nothing rather than quietly passing.
+the same availability, concluded it had the last one, and got it.
+
+**Repeated, because one run could have been luck.** The integration test runs
+the same contest five times against a campaign reset in between, and prints what
+each run oversold:
+
+```
+5 runs of 300 requests against 20 tickets
+  run | sold | oversold
+    1 |  300 |      280
+    2 |  300 |      280
+    3 |  300 |      280
+    4 |  300 |      280
+    5 |  300 |      280
+```
+
+Not a distribution with an unlucky tail — the naive path loses the race every
+time, by the same margin. The test **asserts** that every run oversells, so if
+it ever stops reproducing (a Postgres that locks differently, a machine too slow
+to interleave) the comparison above is known to be measuring nothing rather than
+quietly passing.
 
 The latency column is the part worth reading twice, because it is the opposite
 of what "we added a second datastore" suggests. Phase 1 was not slow because of
