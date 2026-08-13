@@ -1003,9 +1003,9 @@ the dead letter queue, which is the price of not hammering a dependency that is
 already struggling. Some failures skip the waits entirely: a message naming a
 purchase that does not exist, or one already cancelled, fails identically every
 time, so it is marked permanent and parked immediately rather than spending two
-waits proving what the first attempt already knew. Nothing consumes the dead
-letter queue — its purpose is to stop and be looked at, and phase 5.3 is where a
-compensation saga drains it.
+waits proving what the first attempt already knew. The dead letter queue was
+where a message stopped to be looked at; since phase 5.3 a compensation saga
+drains it instead, which is a change of role defended in its own section below.
 
 ### Graceful shutdown, and the number that overrides it
 
