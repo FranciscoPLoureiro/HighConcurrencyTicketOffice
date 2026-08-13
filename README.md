@@ -153,9 +153,11 @@ a client should switch on `error.code`, never on the message.
 | `429` | `rate_limited` | Too many attempts; see `Retry-After` |
 | `400` | `missing_idempotency_key` | No `Idempotency-Key` header |
 | `400` | `invalid_idempotency_key` | The key is not a UUID |
+| `400` | `invalid_identity` | The `X-User-ID` header is longer than 128 bytes |
 | `401` | `missing_identity` | No `X-User-ID` header |
 | `404` | `campaign_not_found` | No such campaign, or Redis holds no stock for it |
 | `404` | `purchase_not_found` | No such purchase — or it belongs to somebody else |
+| `500` | `internal_error` | The system could not decide; nothing is implied about the ticket |
 
 ```json
 { "error": { "code": "already_purchased",
