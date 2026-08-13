@@ -1268,7 +1268,8 @@ exercise made obvious:
 
 ```bash
 make up
-FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s   RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
+FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s \
+  RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
 
 # three sales that die between the decrement and the record
 purchase 1 -> http 500
