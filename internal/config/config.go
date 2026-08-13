@@ -217,9 +217,23 @@ const (
 	// validate() enforces is REQUEST_TIMEOUT + POSTGRES_TIMEOUT, fifteen
 	// seconds with these defaults, and a minute is four times that.
 	defaultReservationAge = time.Minute
-	// Longer than fulfilment takes, or the sweeper starts republishing work
-	// the worker is in the middle of.
-	defaultPendingAge = 2 * time.Minute
+	// Longer than fulfilment takes, and the quantity that matters is how long
+	// the *queue* takes to drain rather than how long one message takes.
+	//
+	// Read as the second, two minutes looks generous against a two second
+	// render. It is not: one worker fulfils in series, so a hundred tickets
+	// need a hundred times two seconds, and every purchase queued behind the
+	// sixtieth crosses this threshold while perfectly healthy. The sweeper
+	// then republishes work nobody was failing to do — measured at 38
+	// republications and 28 duplicate fulfilments on a clean campaign — and
+	// each duplicate costs the worker another full render before it discovers
+	// there is nothing to do, which lengthens the drain that caused it.
+	//
+	// Five minutes clears a single-worker campaign with room to spare. Scaling
+	// workers divides the drain and makes it safer still; the cost of the
+	// larger number is that a purchase whose publish really was lost waits
+	// longer for the sweeper, which is a delay rather than a lost ticket.
+	defaultPendingAge = 5 * time.Minute
 )
 
 // Load reads configuration from the process environment.

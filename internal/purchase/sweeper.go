@@ -60,8 +60,11 @@ type SweepPolicy struct {
 	ReservationAge time.Duration
 
 	// PendingAge is how long a purchase may sit pending before the sweeper
-	// republishes it. Longer than fulfilment takes, or the sweeper competes
-	// with the worker it is meant to be backing up.
+	// republishes it. It has to exceed the time the whole queue takes to
+	// drain, not the time one message takes: workers fulfil in series, so a
+	// purchase at the back of a full campaign sits pending for the length of
+	// everything ahead of it while nothing at all is wrong. Set below that,
+	// the sweeper competes with the worker it is meant to be backing up.
 	PendingAge time.Duration
 
 	// Batch bounds one pass, so that a sweeper starting after a long outage
@@ -72,7 +75,7 @@ type SweepPolicy struct {
 // DefaultSweepPolicy is what the service runs with when a caller supplies none.
 var DefaultSweepPolicy = SweepPolicy{
 	ReservationAge: time.Minute,
-	PendingAge:     2 * time.Minute,
+	PendingAge:     5 * time.Minute,
 	Batch:          500,
 }
 
