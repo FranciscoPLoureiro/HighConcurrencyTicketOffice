@@ -1143,8 +1143,12 @@ across every threshold**, including a p99 that had never seen a single request.
 **Consequences.** `tickets_sold: count==100` guards the sale latency threshold,
 `refusals: count>1000` guards the refusal one, `http_reqs: count>1000` proves
 the script ran at all, and `undocumented_answers: count==0` is a counter this
-project controls rather than a metric whose semantics k6 might rename — as it
-did with `checks`, where the old name silently watches nothing.
+project controls rather than one whose name and semantics belong to k6. That is
+a reason to prefer it, not a claim that the built-in is broken: k6 now reports
+`checks_total`, `checks_succeeded` and `checks_failed` in the summary, and a
+threshold written against the older `checks` still evaluates — the CI run above
+scored it over two hundred thousand samples. It is kept for the summary line,
+and the counters are what the guarantee rests on.
 
 The latency thresholds themselves are on a `Trend` recorded by hand rather than
 on `http_req_duration`, because the outcome of a request is not knowable until
