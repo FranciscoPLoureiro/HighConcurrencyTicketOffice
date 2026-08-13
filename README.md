@@ -1439,11 +1439,16 @@ Kept honest as the project grows.
   oversight: what belongs there is a notification service telling somebody their
   ticket failed, and inventing one would be scope with no design behind it.
 - **The API does not reconnect to RabbitMQ.** The worker does, and loops until
-  it succeeds; the API dials once at startup and, if the connection drops,
-  publishes fail and purchases are reversed until it is restarted. The worker is
-  the process where this matters — one that never reconnects is
-  indistinguishable from a healthy one with an empty queue — and the API at
-  least fails loudly rather than silently.
+  it succeeds; the API dials once at startup, and if that connection drops every
+  publish fails until the process is restarted — including the sweeper's, since
+  it runs inside the API and shares the connection. Those sales are left
+  **pending**, not reversed: an unconfirmed publish may have reached the broker,
+  so undoing it is the one thing that could sell a seat twice. The tickets stay
+  off the shelf, the callers get a `500`, and a restart is what puts it right —
+  reconciliation reads the pending rows as live and the sweeper republishes them
+  on a working connection. Measured, with the broker stopped and restarted
+  underneath a running API: fifteen sales left pending and still failing after
+  the broker came back.
 - Phase 1's naive purchase path is still in the tree, unused by the API. It is
   the baseline the table above is measured against, and an integration test
   asserts that it still oversells — if that ever stops reproducing, the
