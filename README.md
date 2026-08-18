@@ -33,6 +33,15 @@ request.
 Every phase is merged. The remaining work is in the roadmap at the bottom, and
 the known limitations section is honest about what this still does not do.
 
+One of those limitations turned into its own project. Phase 4 measured the p99
+at 100 virtual users moving from 153 ms to 291 ms depending on whether
+Prometheus and Grafana happened to be running, and this README could describe
+the correlation and not the cause. So the cause got measured, with
+[wallclock](https://github.com/FranciscoPLoureiro/wallclock), an eBPF
+wall-clock profiler written for the question. The answer was not the obvious
+one — the API was neither starved of CPU nor throttled — and it is
+[further down](#where-those-milliseconds-actually-went).
+
 ## Quick start
 
 Requires Docker and GNU make. Everything else the project builds or runs with —
