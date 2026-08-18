@@ -246,13 +246,74 @@ fails on a busy one is not a capacity number, it is a coin toss, and a CI gate
 built on one teaches everybody to re-run the build until it goes green. 50 is
 where the result repeats, so 50 is what is declared and what CI runs.
 
-Two honest consequences. The first is that adding observability cost roughly
-half the headroom on this machine — a real trade, paid in capacity for the
-ability to see anything at all. The second is that a p99 over exactly one
+One honest consequence stands whatever the cause: a p99 over exactly one
 hundred samples is close to "the slowest sale of the hundred", which is a weak
-statistic however it comes out; the campaign is a hundred tickets, so there is
+statistic however it comes out. The campaign is a hundred tickets, so there is
 no larger sample to be had, and the number should be read with that in mind
 rather than as a percentile in the usual sense.
+
+#### Where those milliseconds actually went
+
+This README used to say that adding observability cost roughly half the
+headroom on this machine, and stop there. That was a guess wearing the clothes
+of a conclusion. The correlation was solid — the same load, the same laptop,
+Prometheus and Grafana the only difference — and the mechanism behind it was
+never measured. "The observability stack took the CPU and the API got less" is
+what everybody assumes, this README included.
+
+It has since been measured, with an eBPF wall-clock profiler written to answer
+this question. It attaches to the scheduler tracepoints and splits the time a
+thread spent into on-CPU, ready but waiting for a CPU, ready but stopped by its
+own cgroup quota, and blocked. The decomposition closes to 100%, which is what
+makes it an answer rather than a hint: the time has nowhere left to hide.
+
+The API at 100 virtual users, with and without Prometheus and Grafana, the same
+profiling protocol in both, busiest of seven 25-second windows in each:
+
+| | without Prometheus & Grafana | with |
+|---|---|---|
+| threads | 5 | 6 |
+| thread-time | 1m58.08s | 2m15.49s |
+| on-CPU | 20.7% | 21.5% |
+| **runqueue** (ready, no CPU) | **0.4%** | **0.5%** |
+| **throttled** (quota exhausted) | **0.1%** | **0.1%** |
+| blocked | 78.9% | 77.9% |
+
+**The API was neither queued nor throttled.** Both are under one per cent in
+both conditions, and on-CPU barely moves. The assumption was wrong: whatever
+changed, it did not change how much CPU this service got, nor how long it spent
+waiting for one.
+
+What did change is every dependency it talks to. Measuring the interval from a
+send to the next receive on the same socket, per destination:
+
+| destination | without | with | change |
+|---|---|---|---|
+| redis, mean | 1.2 ms | 1.4 ms | +17% |
+| postgres, mean | 5.4 ms | 6.9 ms | +28% |
+| postgres, p99 | 81.9 ms | 114.7 ms | +40% |
+| rabbitmq, mean | 1.6 ms | 2.5 ms | +56% |
+| rabbitmq, p99 | 6.1 ms | 20.5 ms | **+236%** |
+
+So the observability stack was paid for by PostgreSQL, Redis and RabbitMQ
+rather than by the API, and that points somewhere different from where the
+original sentence pointed: at where the dependencies run, not at how much CPU
+the service is given.
+
+**What this does not establish, said plainly.** The per-round-trip differences
+are fractions of a millisecond, and they do not add up to the end-to-end gap.
+Part of the increase is still unaccounted for. The honest reading is "the API
+is not the bottleneck and its dependencies are measurably slower", not a
+complete arithmetic of the extra milliseconds.
+
+None of this changes the operating point. 50 is still where the result repeats
+and still what CI runs — a number that moves when a neighbour starts is not a
+capacity claim regardless of which component the neighbour slowed down. What
+changes is that the sentence explaining it is now a measurement.
+
+The tool, the method, and the several things that turned out to be measuring
+the wrong thing, are in
+[wallclock](https://github.com/FranciscoPLoureiro/wallclock).
 
 ### The load test turns the per-address rate limit off, on purpose
 
@@ -1482,7 +1543,10 @@ Kept honest as the project grows.
   environment and its container limits are declared above, which makes the
   numbers comparable across phases on the same hardware and still meaningless as
   an absolute capacity claim. The p99 at 100 virtual users moved from 153 ms to
-  333 ms purely because Prometheus and Grafana were running the second time.
+  333 ms purely because Prometheus and Grafana were running the second time —
+  [decomposed above](#where-those-milliseconds-actually-went), and not in the
+  way this README first assumed: the API was neither starved of CPU nor
+  throttled, and every dependency it calls got slower instead.
 - **A p99 over a hundred samples is barely a percentile.** The campaign is a
   hundred tickets, so the sale-latency threshold is close to an assertion about
   the single slowest sale. There is no larger sample to be had without changing
