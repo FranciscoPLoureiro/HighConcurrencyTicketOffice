@@ -34,18 +34,30 @@ const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 
 // Chosen from measurement, not from ambition.
 //
-// On the declared environment — the API capped at 2 CPUs and 512 MB, with
-// Prometheus and Grafana running alongside — the thresholds below hold at 50
-// across repeated runs and are unreliable above it. 100 passed once at 153 ms
-// and then failed twice at 291 ms and 333 ms; 150 failed at 451 ms.
+// On the laptop declared in the README — the API capped at 2 CPUs and 512 MB,
+// with Prometheus and Grafana running alongside — the thresholds below hold at
+// 50 across repeated runs and are unreliable above it. 100 passed once at
+// 153 ms and then failed twice at 291 ms and 333 ms; 150 failed at 451 ms.
 //
 // The variance is the finding, not an inconvenience. A number that passes on a
 // quiet machine and fails on a busy one is not a capacity figure, it is a
 // coin toss, and a CI gate built on one teaches people to re-run the build
-// until it goes green. 50 is where the measurement is repeatable.
+// until it goes green. 50 is where that measurement is repeatable.
 //
-// Raising it does not make the system faster; it makes the test measure the
-// laptop. The README records the runs.
+// Repeatable on that machine. The same profile on a faster one passes 150 nine
+// times out of nine, so this default describes the laptop rather than the
+// system. That is the point rather than a defect — the number keeps CI honest
+// on the hardware it was calibrated against, and raising it would only move the
+// calibration to somebody else’s desk.
+//
+// The second machine did settle one thing. The hundred tickets go in the first
+// fraction of a second of the ramp, so purchase_duration{outcome:sold} is
+// sampled before the plateau arrives, and the faster the host the truer that
+// gets — fast enough and the sale p99 falls below the refusal p99, which cannot
+// describe a path that writes to PostgreSQL and publishes to RabbitMQ. Read it
+// as a smoke check that the campaign sold out; the refusal p99 below, over two
+// hundred thousand samples instead of a hundred, is the one that tracks load.
+// The README records the runs.
 const PEAK_VUS = Number(__ENV.VUS || 50);
 
 const sold = new Counter('tickets_sold');
