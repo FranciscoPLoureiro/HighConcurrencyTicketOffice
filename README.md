@@ -54,8 +54,8 @@ the known limitations section is honest about what this still does not do.
 One of those limitations turned into its own project: phase 4 could describe a
 p99 that moved with Prometheus running and not say why. The cause was measured
 with [wallclock](https://github.com/FranciscoPLoureiro/wallclock), an eBPF
-wall-clock profiler written for the question, and the answer was not the
-obvious one —
+wall-clock profiler written for the question. The answer was not the obvious
+one — the API was neither starved of CPU nor throttled — and it is in
 [where those milliseconds went](docs/MEASUREMENT.md#where-those-milliseconds-actually-went).
 
 ## Quick start
@@ -120,7 +120,7 @@ ended up in the dead letter queue.
 
 Run `make` on its own for the full list. The two `load-test` targets that drive
 the API from the host expect a `k6` binary there; the `-internal` one, which is
-the only one whose numbers this README quotes, runs k6 from an image.
+the only one whose numbers are quoted anywhere here, runs k6 from an image.
 
 ## Architecture
 
@@ -184,9 +184,8 @@ closes it with a reservation that expires.
 
 ## Known limitations
 
-The five worth knowing before reading any of the above as a production claim.
-The [full list](docs/LIMITATIONS.md) is longer, and kept honest as the project
-grows.
+The five worth knowing first. The [full list](docs/LIMITATIONS.md) is longer,
+and kept honest as the project grows.
 
 - Authentication is out of scope by design. Requests carry an `X-User-ID`
   header, standing in for a JWT already validated by a gateway. This is a

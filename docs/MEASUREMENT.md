@@ -1,6 +1,6 @@
 # Measurement
 
-How the numbers in the README were produced, on which machines, and what
+How every number in this project was produced, on which machines, and what
 moved when the machine changed.
 
 ## Measure the generator before believing the numbers
