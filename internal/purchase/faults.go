@@ -56,7 +56,7 @@ type Faults struct {
 	// a single instance nothing sweeps until the process returns, and what
 	// recovers the ticket then is startup reconciliation, which rebuilds
 	// Redis from PostgreSQL before serving anything. Two mechanisms, two
-	// failures, and the README demonstrates both.
+	// failures, and docs/DECISIONS.md demonstrates both.
 	Kill func()
 }
 

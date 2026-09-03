@@ -6,10 +6,10 @@
 -- The API writes the row as 'pending' the instant Redis grants the ticket, and
 -- the worker moves it to 'confirmed' once the document exists. That ordering is
 -- a deliberate departure from the brief's diagram, which has the worker insert
--- the row instead; the README argues it at length. The short version is that
--- startup reconciliation reads this table to decide how much stock is left, so
--- a sale the table will not hear about for two seconds is a sale that a restart
--- inside those two seconds hands out to somebody else.
+-- the row instead; docs/DECISIONS.md argues it at length. The short version is
+-- that startup reconciliation reads this table to decide how much stock is
+-- left, so a sale the table will not hear about for two seconds is a sale that
+-- a restart inside those two seconds hands out to somebody else.
 --
 -- 'failed' is a purchase the worker gave up on after exhausting its retries.
 -- It is not 'cancelled', and the distance between the two is load bearing:

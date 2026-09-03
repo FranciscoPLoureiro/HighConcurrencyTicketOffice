@@ -38,7 +38,8 @@ type PoolConfig struct {
 }
 
 // DefaultPoolConfig is the sizing this service runs with, and the reasoning is
-// in the README as well as here because the brief asks for it explicitly.
+// in docs/DECISIONS.md as well as here because the brief asks for it
+// explicitly.
 //
 // MaxConns is small on purpose. The instinct is to raise it under load, and it
 // is the wrong instinct: PostgreSQL serves each connection with a backend

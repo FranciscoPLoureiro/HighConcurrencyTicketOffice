@@ -8,8 +8,8 @@
 // can look at it rather than in a loop nobody notices.
 //
 // Delivery is at-least-once, and no configuration turns that into exactly-once.
-// The consumer is expected to be idempotent; see the README for why that is the
-// only honest arrangement.
+// The consumer is expected to be idempotent; see docs/DECISIONS.md for why
+// that is the only honest arrangement.
 package queue
 
 import (

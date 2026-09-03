@@ -12,8 +12,8 @@ import (
 // gateway has already validated a JWT and passes the subject downstream, which
 // is a normal arrangement — and one that is only safe when nothing can reach
 // this service except through that gateway. Exposed directly, this header lets
-// anyone claim to be anyone. The README states the assumption rather than
-// leaving a reader to discover it here.
+// anyone claim to be anyone. docs/LIMITATIONS.md states the assumption rather
+// than leaving a reader to discover it here.
 const userIDHeader = "X-User-ID"
 
 // maxUserIDLength bounds what is accepted as an identity.

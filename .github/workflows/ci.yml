@@ -119,7 +119,7 @@ jobs:
         # runner is a shared machine with neighbours nobody can see, so the
         # operating point here is deliberately conservative: this job exists to
         # catch a regression in the invariant, not to publish a latency figure.
-        # The numbers quoted in the README come from the declared environment.
+        # The numbers in docs/MEASUREMENT.md come from the declared environment.
         run: |
           docker run --rm --network ticket-office_default \
             -v "$PWD/loadtest":/loadtest \

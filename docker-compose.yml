@@ -28,7 +28,8 @@ services:
       RATE_LIMIT_IP: "${RATE_LIMIT_IP:-1000}"
 
       # Overridable so the lost-ticket demonstration can be run against this
-      # stack without editing anything. See "the lost ticket" in the README:
+      # stack without editing anything. See "the lost ticket" in
+      # docs/DECISIONS.md:
       #
       #   FAULT_INJECTION=after-decrement REQUEST_TIMEOUT=5s \
       #     RESERVATION_AGE=15s SWEEP_INTERVAL=5s docker compose up -d --wait api
@@ -64,9 +65,9 @@ services:
     # idle one exits immediately.
     stop_grace_period: 30s
     # Explicit limits, because a load test against an unbounded container
-    # measures the developer's laptop rather than the service. The README
-    # declares the machine these were chosen for; the point is not the numbers
-    # but that the same numbers apply on every run.
+    # measures the developer's laptop rather than the service. The machine
+    # these were chosen for is declared in docs/MEASUREMENT.md; the point is
+    # not the numbers but that the same numbers apply on every run.
     deploy:
       resources:
         limits:
@@ -121,9 +122,9 @@ services:
     # the same as "it does not happen", and the deliverable was the second one.
     stop_grace_period: 30s
     # Explicit limits, because a load test against an unbounded container
-    # measures the developer's laptop rather than the service. The README
-    # declares the machine these were chosen for; the point is not the numbers
-    # but that the same numbers apply on every run.
+    # measures the developer's laptop rather than the service. The machine
+    # these were chosen for is declared in docs/MEASUREMENT.md; the point is
+    # not the numbers but that the same numbers apply on every run.
     deploy:
       resources:
         limits:
@@ -144,9 +145,9 @@ services:
   postgres:
     image: postgres:18-alpine
     # Explicit limits, because a load test against an unbounded container
-    # measures the developer's laptop rather than the service. The README
-    # declares the machine these were chosen for; the point is not the numbers
-    # but that the same numbers apply on every run.
+    # measures the developer's laptop rather than the service. The machine
+    # these were chosen for is declared in docs/MEASUREMENT.md; the point is
+    # not the numbers but that the same numbers apply on every run.
     deploy:
       resources:
         limits:
@@ -179,9 +180,9 @@ services:
   redis:
     image: redis:8-alpine
     # Explicit limits, because a load test against an unbounded container
-    # measures the developer's laptop rather than the service. The README
-    # declares the machine these were chosen for; the point is not the numbers
-    # but that the same numbers apply on every run.
+    # measures the developer's laptop rather than the service. The machine
+    # these were chosen for is declared in docs/MEASUREMENT.md; the point is
+    # not the numbers but that the same numbers apply on every run.
     deploy:
       resources:
         limits:
@@ -227,9 +228,9 @@ services:
   rabbitmq:
     image: rabbitmq:4-management-alpine
     # Explicit limits, because a load test against an unbounded container
-    # measures the developer's laptop rather than the service. The README
-    # declares the machine these were chosen for; the point is not the numbers
-    # but that the same numbers apply on every run.
+    # measures the developer's laptop rather than the service. The machine
+    # these were chosen for is declared in docs/MEASUREMENT.md; the point is
+    # not the numbers but that the same numbers apply on every run.
     deploy:
       resources:
         limits:
@@ -265,7 +266,7 @@ services:
       start_period: 40s
 
   # Observability. Both are provisioned entirely by file — no clicking, no
-  # dashboard saved in somebody's browser, and a screenshot in the README that
+  # dashboard saved in somebody's browser, and a screenshot in the docs that
   # anybody can reproduce with one command.
   prometheus:
     image: prom/prometheus:v3.7.3
@@ -322,7 +323,7 @@ services:
     depends_on:
       - prometheus
 
-  # Headless Chromium, so that the dashboard in the README is exported by a
+  # Headless Chromium, so that the dashboard in the docs is exported by a
   # command rather than cropped out of somebody's browser. Behind a profile
   # because it is a documentation tool and has no business in the stack a load
   # test measures — `docker compose --profile tools up -d renderer`, or just

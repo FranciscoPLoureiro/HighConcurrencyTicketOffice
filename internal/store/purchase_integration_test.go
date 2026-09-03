@@ -125,8 +125,9 @@ func TestEnsureCampaignNeverRefillsTheStock(t *testing.T) {
 // Between reading `available` and decrementing it, every other request reads
 // the same value and reaches the same conclusion, so far more tickets are sold
 // than exist. The test asserts the failure because the whole phase 1 to phase 2
-// argument rests on it: if this ever stops reproducing, the comparison in the
-// README is measuring nothing and should fail loudly rather than quietly pass.
+// argument rests on it: if this ever stops reproducing, the comparison in
+// docs/DECISIONS.md is measuring nothing and should fail loudly rather than
+// quietly pass.
 func TestTheNaivePathOversellsUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -177,8 +178,8 @@ func TestTheNaivePathOversellsUnderConcurrency(t *testing.T) {
 // The brief is specific about why: a single print showing an oversell "pode ter
 // sido sorte", and the quantified proof it asks for is N runs with the excess
 // printed for each. One run cannot distinguish a race that always loses from a
-// race that lost once — and the whole comparison table in the README rests on
-// this number being characteristic rather than lucky.
+// race that lost once — and the whole comparison table in docs/DECISIONS.md
+// rests on this number being characteristic rather than lucky.
 //
 // So this runs the same contest repeatedly against a campaign reset in between,
 // prints the table, and fails if *any* run failed to oversell. That last part is

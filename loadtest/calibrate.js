@@ -13,8 +13,8 @@
 //
 //   make load-test-calibrate
 //
-// The number it prints goes in the README, and the VU count for the campaign is
-// chosen from it rather than from ambition.
+// The number it prints goes in docs/MEASUREMENT.md, and the VU count for the
+// campaign is chosen from it rather than from ambition.
 import http from 'k6/http';
 import { check } from 'k6';
 

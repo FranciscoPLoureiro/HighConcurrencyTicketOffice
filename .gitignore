@@ -23,9 +23,8 @@ coverage.html
 enunciado_bilheteira_*.pdf
 enunciado_bilheteira_*.docx
 
-# Private working notes. The reasoning that matters is in the README as
-# architectural decisions, where it reads as engineering rather than as
-# rehearsal for a conversation.
+# Private working notes. The reasoning that matters is in docs/DECISIONS.md,
+# where it reads as engineering rather than as rehearsal for a conversation.
 NOTES-*.md
 
 # Editors and OS noise

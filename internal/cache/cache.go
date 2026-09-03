@@ -6,8 +6,8 @@
 //
 // Every decision that has to be indivisible is written as a Lua script in
 // scripts/ and executed there. The alternative, WATCH/MULTI/EXEC, is discussed
-// in the README; the short version is that optimistic locking degrades as
-// contention rises, and contention is the entire problem here.
+// in docs/DECISIONS.md; the short version is that optimistic locking degrades
+// as contention rises, and contention is the entire problem here.
 package cache
 
 import (
